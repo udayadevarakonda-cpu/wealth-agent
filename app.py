@@ -678,12 +678,17 @@ with tab2:
         # data instead of another guess.
         sub_debug = ipo_meta.get("subscription_debug")
         any_open = (reco_df["Status"] == "OPEN").any() if not reco_df.empty else False
-        all_sub_missing = reco_df["Sub — QIB (x)"].isna().all() if "Sub — QIB (x)" in reco_df.columns else True
-        if sub_debug and any_open and all_sub_missing:
-            with st.expander("🔍 Diagnostic: live subscription fetch (all open issues show 'Calendar only')"):
+        qib_missing = reco_df["Sub — QIB (x)"].isna().all() if "Sub — QIB (x)" in reco_df.columns else True
+        nii_missing = reco_df["Sub — NII/HNI (x)"].isna().all() if "Sub — NII/HNI (x)" in reco_df.columns else True
+        # Trigger on EITHER field being universally blank -- QIB working
+        # while NII doesn't (or vice versa) is just as much a real mapping
+        # gap as both being blank, and deserves the same raw-data check.
+        if sub_debug and any_open and (qib_missing or nii_missing):
+            with st.expander("🔍 Diagnostic: live subscription fetch (QIB and/or NII/HNI not populating)"):
                 st.write(f"**Symbol tested:** {sub_debug.get('symbol')}")
                 st.write(f"**URL called:** {sub_debug.get('url')}")
                 st.write(f"**HTTP status:** {sub_debug.get('status_code')}")
+                st.write(f"**QIB missing across all rows:** {qib_missing} · **NII/HNI missing across all rows:** {nii_missing}")
                 if sub_debug.get("exception"):
                     st.error(f"Request failed: {sub_debug['exception']}")
                 elif sub_debug.get("raw_json") is not None:
