@@ -554,8 +554,10 @@ with tab2:
                 st.write(f"**HTTP status:** {sub_debug.get('status_code')}")
                 if sub_debug.get("exception"):
                     st.error(f"Request failed: {sub_debug['exception']}")
-                elif sub_debug.get("raw_text"):
-                    st.code(sub_debug["raw_text"], language="json")
+                elif sub_debug.get("raw_json") is not None:
+                    st.json(sub_debug["raw_json"])
+                elif sub_debug.get("raw_text_snippet"):
+                    st.code(sub_debug["raw_text_snippet"], language="text")
                 st.caption(
                     "This is NSE's actual response for the subscription endpoint this tool guessed at. "
                     "Share this output to get the field-mapping (or the endpoint itself) corrected."

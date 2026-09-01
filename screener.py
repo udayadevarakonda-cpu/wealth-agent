@@ -1053,39 +1053,78 @@ def get_live_ipo_calendar():
                 capture_this_one = subscription_debug is None  # only capture the first attempt, to keep meta small
                 try:
                     bid_resp = session.get(NSE_IPO_BID_URL, params={"symbol": symbol, "series": "EQ"}, timeout=8)
+                    bid_json = None
+                    if bid_resp.status_code == 200:
+                        try:
+                            bid_json = bid_resp.json()
+                        except Exception:
+                            bid_json = None
+
                     if capture_this_one:
                         subscription_debug = {
                             "symbol": symbol, "url": bid_resp.url, "status_code": bid_resp.status_code,
-                            "raw_text": bid_resp.text[:1500], "exception": None,
+                            "raw_json": bid_json,
+                            "raw_text_snippet": bid_resp.text[:1000] if bid_json is None else None,
+                            "exception": None,
                         }
-                    if bid_resp.status_code == 200:
-                        bid_json = bid_resp.json()
-                        bid_data = bid_json if isinstance(bid_json, dict) else {}
-                        # NSE's category breakdown may come as flat keys or a
-                        # nested list of {category, subscription} rows --
-                        # tried both shapes since the exact structure is
-                        # unverified from this dev environment.
-                        sub_overall = _pick(bid_data, "totalSubscription", "overallSubscription")
-                        sub_qib = _pick(bid_data, "qib", "QIB", "qibSubscription")
-                        sub_nii = _pick(bid_data, "nii", "NII", "hni", "niiSubscription")
-                        sub_rii = _pick(bid_data, "rii", "RII", "retail", "riiSubscription")
-                        if sub_qib is None and isinstance(bid_data.get("data"), list):
-                            for cat_row in bid_data["data"]:
-                                cat_name = str(_pick(cat_row, "category", "categoryName", default="")).upper()
-                                cat_sub = _pick(cat_row, "subscription", "noOfTimesSubscribed", "subTimes")
-                                if "QIB" in cat_name and sub_qib is None:
-                                    sub_qib = cat_sub
-                                elif ("NII" in cat_name or "HNI" in cat_name) and sub_nii is None:
-                                    sub_nii = cat_sub
-                                elif ("RII" in cat_name or "RETAIL" in cat_name) and sub_rii is None:
-                                    sub_rii = cat_sub
-                                elif "TOTAL" in cat_name and sub_overall is None:
-                                    sub_overall = cat_sub
+
+                    if isinstance(bid_json, dict):
+                        data_list = bid_json.get("dataList", [])
+                        # NSE's first dataList element is a HEADER/label row
+                        # (category="Category", noOfShareOffered="No.of shares
+                        # offered/reserved", ...) describing what each key
+                        # means -- confirmed via the live diagnostic panel,
+                        # not guessed. Real rows (QIB/NII/RII/Total/...)
+                        # follow it; skip anything whose category is
+                        # literally the label "Category".
+                        data_rows = [
+                            r for r in data_list
+                            if isinstance(r, dict) and str(r.get("category", "")).strip().upper() != "CATEGORY"
+                        ]
+
+                        def _row_times_subscribed(r):
+                            # Prefer an explicit "times subscribed" field if
+                            # NSE provides one under some field name; otherwise
+                            # compute it directly from shares bid / shares
+                            # offered -- the actual definition of the
+                            # subscription multiple, so this works even if
+                            # NSE never exposes a precomputed ratio field.
+                            explicit = _pick(r, "noOfTimesSubscribed", "subscriptionTimes", "noOfTimeSubscribed")
+                            if explicit not in (None, ""):
+                                try:
+                                    return float(str(explicit).replace(",", ""))
+                                except (TypeError, ValueError):
+                                    pass
+                            bid_shares = _pick(r, "noOfSharesBid", "noOfSharesBidFor")
+                            offered_shares = _pick(r, "noOfShareOffered", "noOfSharesOffered")
+                            try:
+                                bid_shares = float(str(bid_shares).replace(",", ""))
+                                offered_shares = float(str(offered_shares).replace(",", ""))
+                                if offered_shares > 0:
+                                    return round(bid_shares / offered_shares, 2)
+                            except (TypeError, ValueError):
+                                pass
+                            return None
+
+                        for r in data_rows:
+                            cat_name = str(_pick(r, "category", default="")).upper()
+                            times = _row_times_subscribed(r)
+                            if times is None:
+                                continue
+                            if "QIB" in cat_name and sub_qib is None:
+                                sub_qib = times
+                            elif ("NII" in cat_name or "HNI" in cat_name or "NON-INSTITUTIONAL" in cat_name) and sub_nii is None:
+                                sub_nii = times
+                            elif ("RII" in cat_name or "RETAIL" in cat_name) and sub_rii is None:
+                                sub_rii = times
+                            elif "TOTAL" in cat_name and sub_overall is None:
+                                sub_overall = times
                 except Exception as e:
                     if capture_this_one:
                         subscription_debug = {
                             "symbol": symbol, "url": NSE_IPO_BID_URL, "status_code": None,
-                            "raw_text": None, "exception": f"{type(e).__name__}: {e}",
+                            "raw_json": None, "raw_text_snippet": None,
+                            "exception": f"{type(e).__name__}: {e}",
                         }
                     pass  # subscription is best-effort; the calendar row still stands without it
 
