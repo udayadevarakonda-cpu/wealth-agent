@@ -13,6 +13,8 @@ from screener import (
     run_historical_backtest,
     get_live_ipo_calendar,
     build_ipo_recommendation,
+    compute_ipo_valuation_tiers,
+    compute_brlm_track_record,
     DEFAULT_SCORECARD_WEIGHTS
 )
 
@@ -252,11 +254,12 @@ st.markdown("---")
 # =============================================================================
 # MAIN TABS (4 TABS)
 # =============================================================================
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📊 Strategic Asset Allocation & Detailed Blueprint",
     "🎯 Tactical Stock Momentum",
     "📈 Core Mutual Fund Qualifier Engine",
-    "🧪 Scenario Sandbox & Backtest Simulator"
+    "🧪 Scenario Sandbox & Backtest Simulator",
+    "📒 Personal IPO Tracker"
 ])
 
 # =============================================================================
@@ -867,3 +870,166 @@ with tab4:
                 trades_df = bt_results["trades_df"]
                 st.markdown("##### 📋 Historical Trade Log (Sample)")
                 st.dataframe(trades_df.head(20), use_container_width=True, hide_index=True)
+
+# =============================================================================
+# TAB 5: PERSONAL IPO VALUATION TRACKER
+# =============================================================================
+with tab5:
+    st.subheader("📒 Personal IPO Valuation Tracker")
+    st.caption(
+        "A calculator you feed real RHP numbers into — not an auto-populated feature. "
+        "Peer P/E and BRLM track record aren't reliably extractable from NSE's live feeds "
+        "(they live in each IPO's own PDF prospectus), so this stays manual by design."
+    )
+    st.info(
+        "📄 **Where to find these numbers:** every mainboard RHP's \"Price Band Advertisement\" or "
+        "the RHP itself has a **\"Basis for the Offer Price\"** section with your company's P/E, "
+        "the peer group P/E (highest/lowest/average), and a **\"Risk to Investors\"** section stating "
+        "how many of the lead manager's past IPOs closed below issue price on listing day. "
+        "Copy those numbers in below."
+    )
+
+    if "ipo_tracker_entries" not in st.session_state:
+        st.session_state.ipo_tracker_entries = []
+
+    with st.form("ipo_tracker_form", clear_on_submit=False):
+        st.markdown("##### ➕ Add / Update an IPO")
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            t_company = st.text_input("Company Name", key="t_company")
+            t_symbol = st.text_input("Symbol (optional)", key="t_symbol")
+        with fc2:
+            t_cap_price = st.number_input("Cap Price (₹)", min_value=0.0, value=0.0, step=1.0, key="t_cap_price")
+            t_company_pe = st.number_input("Company P/E at Cap Price", min_value=0.0, value=0.0, step=0.1, key="t_company_pe")
+        with fc3:
+            t_qty = st.number_input("Qty Allotted (optional, fill in once known)", min_value=0, value=0, step=1, key="t_qty")
+
+        st.markdown("**Peer Group P/E** (from \"Basis for the Offer Price\")")
+        pc1, pc2, pc3 = st.columns(3)
+        with pc1:
+            t_peer_low = st.number_input("Peer P/E — Lowest", min_value=0.0, value=0.0, step=0.1, key="t_peer_low")
+        with pc2:
+            t_peer_avg = st.number_input("Peer P/E — Average", min_value=0.0, value=0.0, step=0.1, key="t_peer_avg")
+        with pc3:
+            t_peer_high = st.number_input("Peer P/E — Highest", min_value=0.0, value=0.0, step=0.1, key="t_peer_high")
+
+        st.markdown("**BRLM Track Record** (from \"Risk to Investors\")")
+        bc1, bc2, bc3 = st.columns(3)
+        with bc1:
+            t_brlm_name = st.text_input("BRLM Name (optional)", key="t_brlm_name")
+        with bc2:
+            t_brlm_total = st.number_input("Total Issues Handled (past 3 yrs)", min_value=0, value=0, step=1, key="t_brlm_total")
+        with bc3:
+            t_brlm_closed_below = st.number_input("Of Those, Closed Below Issue Price", min_value=0, value=0, step=1, key="t_brlm_closed_below")
+
+        submitted = st.form_submit_button("💾 Save Entry", use_container_width=True)
+
+    if submitted:
+        if not t_company or t_cap_price <= 0 or t_company_pe <= 0:
+            st.error("Company Name, Cap Price, and Company P/E are required.")
+        else:
+            entry = {
+                "Company": t_company, "Symbol": t_symbol or "—",
+                "Cap Price (₹)": t_cap_price, "Company P/E": t_company_pe,
+                "Peer P/E Low": t_peer_low or None, "Peer P/E Avg": t_peer_avg or None, "Peer P/E High": t_peer_high or None,
+                "Qty Allotted": t_qty or None,
+                "BRLM Name": t_brlm_name or "—", "BRLM Total Issues": t_brlm_total or None, "BRLM Closed Below": t_brlm_closed_below or None,
+            }
+            # Update in place if the company's already tracked, else append.
+            existing_idx = next((i for i, e in enumerate(st.session_state.ipo_tracker_entries) if e["Company"] == t_company), None)
+            if existing_idx is not None:
+                st.session_state.ipo_tracker_entries[existing_idx] = entry
+            else:
+                st.session_state.ipo_tracker_entries.append(entry)
+            st.success(f"Saved {t_company}.")
+
+    st.markdown("---")
+
+    if not st.session_state.ipo_tracker_entries:
+        st.info("No IPOs tracked yet this session — add one above, or upload a previously saved tracker CSV below.")
+    else:
+        st.markdown("##### 📊 Tracked IPOs — Valuation Re-Rating & BRLM Risk")
+        display_rows = []
+        for entry in st.session_state.ipo_tracker_entries:
+            valuation = compute_ipo_valuation_tiers(
+                entry["Cap Price (₹)"], entry["Company P/E"],
+                entry["Peer P/E Low"], entry["Peer P/E Avg"], entry["Peer P/E High"],
+                qty_allotted=entry["Qty Allotted"],
+            )
+            brlm = compute_brlm_track_record(entry["BRLM Closed Below"], entry["BRLM Total Issues"])
+
+            row = {
+                "Company": entry["Company"], "Symbol": entry["Symbol"], "Cap Price (₹)": entry["Cap Price (₹)"],
+                "Company P/E": entry["Company P/E"],
+            }
+            if valuation:
+                row["P/E vs Peer Avg"] = f"{valuation['pe_vs_peer_avg_pct']}%" if valuation["pe_vs_peer_avg_pct"] is not None else "—"
+                for label in ["Peer Low", "Peer Average", "Peer High"]:
+                    t = valuation["tiers"].get(label)
+                    row[f"{label} → Price"] = f"₹{t['implied_price']:,.2f} ({t['gain_pct']:+.1f}%)" if t else "—"
+            if brlm:
+                flag_icon = "🔴" if brlm["flag"] else "🟢"
+                row["BRLM Track Record"] = f"{flag_icon} {entry['BRLM Closed Below']}/{entry['BRLM Total Issues']} closed below ({brlm['pct_closed_below']}%)"
+            else:
+                row["BRLM Track Record"] = "—"
+            display_rows.append(row)
+
+        tracker_df = pd.DataFrame(display_rows)
+        st.dataframe(tracker_df, use_container_width=True, hide_index=True)
+
+        # Per-company detail: sell-value tiers once Qty Allotted is known.
+        with st.expander("🔎 Per-company detail — implied sell value at each re-rating tier"):
+            for entry in st.session_state.ipo_tracker_entries:
+                valuation = compute_ipo_valuation_tiers(
+                    entry["Cap Price (₹)"], entry["Company P/E"],
+                    entry["Peer P/E Low"], entry["Peer P/E Avg"], entry["Peer P/E High"],
+                    qty_allotted=entry["Qty Allotted"],
+                )
+                st.markdown(f"**{entry['Company']}**")
+                if not valuation or not valuation["tiers"]:
+                    st.caption("Not enough peer P/E data entered to compute tiers.")
+                    continue
+                for label, t in valuation["tiers"].items():
+                    line = f"- {label} (peer P/E re-rating) → ₹{t['implied_price']:,.2f} ({t['gain_pct']:+.1f}% vs cap price)"
+                    if "position_value" in t:
+                        line += f" — position value: ₹{t['position_value']:,.2f}"
+                    st.write(line)
+                if not entry["Qty Allotted"]:
+                    st.caption("Enter Qty Allotted above (once known) to see position value at each tier.")
+
+        st.caption(
+            "⚠️ These are re-rating SCENARIOS, not predictions — they answer \"if the market re-prices "
+            "this to peer-low/average/high multiples, what would that imply,\" assuming earnings stay "
+            "flat. They don't tell you whether or when a re-rating happens. BRLM track record is a "
+            "disclosed historical fact, not a guarantee about this specific issue."
+        )
+
+        dc1, dc2 = st.columns(2)
+        with dc1:
+            csv_bytes = pd.DataFrame(st.session_state.ipo_tracker_entries).to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Download Tracker as CSV", data=csv_bytes,
+                file_name=f"ipo_tracker_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv", use_container_width=True,
+            )
+        with dc2:
+            if st.button("🗑️ Clear All Tracked IPOs", use_container_width=True):
+                st.session_state.ipo_tracker_entries = []
+                st.rerun()
+
+    st.markdown("---")
+    st.markdown("##### 📤 Restore a Previously Saved Tracker")
+    st.caption(
+        "Streamlit Cloud's file system resets on every reboot, so nothing here saves permanently on "
+        "the server. Download your tracker before closing the tab, and re-upload it next session to "
+        "pick up where you left off."
+    )
+    uploaded_tracker = st.file_uploader("Upload a previously downloaded tracker CSV", type=["csv"], key="tracker_upload")
+    if uploaded_tracker is not None:
+        try:
+            restored_df = pd.read_csv(uploaded_tracker)
+            restored_entries = restored_df.where(pd.notnull(restored_df), None).to_dict("records")
+            st.session_state.ipo_tracker_entries = restored_entries
+            st.success(f"Restored {len(restored_entries)} tracked IPO(s). Scroll up to see them.")
+        except Exception as e:
+            st.error(f"Couldn't read that file: {type(e).__name__}: {e}")

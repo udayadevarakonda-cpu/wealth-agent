@@ -1419,3 +1419,68 @@ def build_ipo_recommendation(df):
     df["Recommendation Note"] = [t[1] for t in tags]
     df["Live Data Completeness"] = [t[2] for t in tags]
     return df
+
+
+# =============================================================================
+# 10. PERSONAL IPO VALUATION TRACKER (Peer P/E Re-Rating + BRLM Track Record)
+# =============================================================================
+# These two functions power a MANUAL personal tracker, not an auto-populated
+# feature. The inputs (company P/E, peer P/E low/avg/high, BRLM track
+# record) come from each IPO's own RHP "Basis for the Offer Price" section
+# and "Risk to Investors" disclosures -- a SEBI-mandated structured table
+# in every mainboard RHP, but delivered as a company-specific PDF, not a
+# queryable API. Auto-extracting it reliably across every IPO's differently
+# formatted RHP is a materially bigger, fragile undertaking than the rest
+# of this tool -- so this stays a calculator you feed real numbers into,
+# not something that guesses or scrapes them.
+def compute_ipo_valuation_tiers(cap_price, company_pe, peer_pe_low, peer_pe_avg, peer_pe_high, qty_allotted=None):
+    """
+    Computes objective re-rating price tiers from the company's OWN
+    disclosed P/E versus its peer group's P/E range -- replacing guessed
+    round-number % bands with numbers the RHP itself discloses.
+
+    Logic: Price = EPS x P/E, and EPS is implied by cap_price / company_pe
+    (holding earnings constant). Re-rating to a different peer P/E level
+    implies Price_new = cap_price * (peer_pe / company_pe). This is a
+    standard first-pass valuation re-rating calculation -- it assumes
+    earnings stay flat and answers "IF the market re-rates this stock to
+    peer-low/average/high multiples, what price would that imply," NOT a
+    prediction of whether or when a re-rating happens.
+    """
+    if not (cap_price and company_pe and company_pe > 0):
+        return None
+
+    def _implied(peer_pe):
+        if not peer_pe or peer_pe <= 0:
+            return None
+        price = round(cap_price * (peer_pe / company_pe), 2)
+        gain_pct = round(((price / cap_price) - 1) * 100, 1)
+        return price, gain_pct
+
+    tiers = {}
+    for label, peer_pe in [("Peer Low", peer_pe_low), ("Peer Average", peer_pe_avg), ("Peer High", peer_pe_high)]:
+        result = _implied(peer_pe)
+        if result:
+            entry = {"implied_price": result[0], "gain_pct": result[1]}
+            if qty_allotted:
+                entry["position_value"] = round(result[0] * qty_allotted, 2)
+            tiers[label] = entry
+
+    pe_vs_peer_avg_pct = round(((company_pe / peer_pe_avg) - 1) * 100, 1) if peer_pe_avg else None
+
+    return {"tiers": tiers, "pe_vs_peer_avg_pct": pe_vs_peer_avg_pct}
+
+
+def compute_brlm_track_record(closed_below_count, total_count):
+    """
+    Every RHP discloses how many IPOs each Book Running Lead Manager has
+    handled in the past 3 years, and how many of those closed BELOW their
+    issue price on listing day -- a real, disclosed, directly relevant
+    track record, arguably more predictive of listing-day outcome than the
+    peer P/E comparison. Flags at >=40% as a simple, transparent threshold
+    -- adjust it yourself if you'd rather use a different cutoff.
+    """
+    if not total_count:
+        return None
+    pct = round((closed_below_count / total_count) * 100, 1)
+    return {"pct_closed_below": pct, "flag": pct >= 40.0}
