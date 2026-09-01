@@ -1,4 +1,5 @@
 import io
+import re
 import time
 import requests
 import numpy as np
@@ -933,7 +934,6 @@ def compute_adx_series(df, period=14):
 # table looks wrong, and the field-mapping can be tightened from there.
 NSE_HOME_URL = "https://www.nseindia.com/"
 NSE_IPO_API_URL = "https://www.nseindia.com/api/all-upcoming-issues?category=ipo"
-NSE_IPO_BID_URL = "https://www.nseindia.com/api/ipo-active-category"
 NSE_IPO_DETAIL_URL = "https://www.nseindia.com/api/ipo-detail"
 
 _NSE_HEADERS = {
@@ -1008,8 +1008,7 @@ def get_live_ipo_calendar():
 
     today = _dt.date.today()
     processed, skipped = [], []
-    subscription_debug = None  # captures the FIRST live subscription attempt, whatever the outcome
-    detail_debug = None  # captures the FIRST live per-symbol detail attempt (lot size / fresh issue)
+    detail_debug = None  # captures the FIRST live per-symbol ipo-detail attempt (subscription + lot size + fresh issue)
 
     for row in raw_rows:
         try:
@@ -1040,19 +1039,22 @@ def get_live_ipo_calendar():
             price_band = _pick(row, "issuePrice", "priceBand", "price")
             issue_size = _pick(row, "issueSize", "totalIssueSize")
 
-            # Lot size and fresh-issue split are NOT present in the calendar
-            # endpoint's row at all (confirmed live -- the full raw row was
-            # inspected and neither field exists there). Try ONE additional
-            # per-symbol detail endpoint that sometimes carries this, same
-            # unverified-but-plausible basis as the other two endpoints this
-            # tool guessed correctly. Captured via its own diagnostic below
-            # so a wrong guess here is visible, not silently wrong.
+            # Everything below -- subscription by category AND lot size /
+            # fresh-issue split -- comes from ONE endpoint: ipo-detail.
+            # Confirmed live that this single response contains both the
+            # category breakdown (under "activeCat.dataList", same schema
+            # this tool already parses) AND a free-text "issueInfo.dataList"
+            # with a real "Bid Lot" field and an "Issue Size" description
+            # that spells out Fresh Issue vs Offer-For-Sale in share counts.
+            # This replaces two separate per-symbol calls with one.
             lot_size = None
             fresh_issue_pct = None
-            detail_capture_this_one = detail_debug is None
-            if symbol:
+            sub_overall = sub_qib = sub_nii = sub_rii = None
+
+            if symbol and status == "OPEN":
+                capture_this_one = detail_debug is None  # only capture the first attempt, to keep meta small
                 try:
-                    detail_resp = session.get(NSE_IPO_DETAIL_URL, params={"symbol": symbol, "series": "EQ"}, timeout=8)
+                    detail_resp = session.get(NSE_IPO_DETAIL_URL, params={"symbol": symbol, "series": "EQ"}, timeout=10)
                     detail_json = None
                     if detail_resp.status_code == 200:
                         try:
@@ -1060,82 +1062,48 @@ def get_live_ipo_calendar():
                         except Exception:
                             detail_json = None
 
-                    if detail_capture_this_one:
+                    if capture_this_one:
+                        # Trim the large demand-graph/bid-history arrays before
+                        # storing for diagnostics -- not used, and they bloat
+                        # the capture with hundreds of price-point entries.
+                        trimmed = None
+                        if isinstance(detail_json, dict):
+                            trimmed = {
+                                k: v for k, v in detail_json.items()
+                                if k not in ("demandGraph", "demandGraphALL", "demandDataNSE", "demandDataBSE")
+                            }
                         detail_debug = {
                             "symbol": symbol, "url": detail_resp.url, "status_code": detail_resp.status_code,
-                            "raw_json": detail_json,
+                            "raw_json": trimmed,
                             "raw_text_snippet": detail_resp.text[:1000] if detail_json is None else None,
                             "exception": None,
                         }
 
                     if isinstance(detail_json, dict):
-                        detail_data = detail_json if "lotSize" in detail_json or "marketLot" in detail_json else detail_json.get("data", detail_json)
-                        lot_size = _pick(detail_data, "lotSize", "marketLot", "minBidQuantity", "minLotSize")
-                        fresh_amt = _pick(detail_data, "freshIssueSize", "freshIssueAmount", "freshIssue")
-                        ofs_amt = _pick(detail_data, "offerForSaleSize", "ofsSize", "offerForSale")
-                        total_amt = issue_size
-                        try:
-                            if fresh_amt is not None and total_amt not in (None, 0, "0", ""):
-                                fresh_issue_pct = round((float(fresh_amt) / float(total_amt)) * 100, 1)
-                            elif fresh_amt is not None and ofs_amt is not None:
-                                fresh_issue_pct = round((float(fresh_amt) / (float(fresh_amt) + float(ofs_amt))) * 100, 1)
-                        except (TypeError, ValueError, ZeroDivisionError):
-                            fresh_issue_pct = None
-                except Exception as e:
-                    if detail_capture_this_one:
-                        detail_debug = {
-                            "symbol": symbol, "url": NSE_IPO_DETAIL_URL, "status_code": None,
-                            "raw_json": None, "raw_text_snippet": None,
-                            "exception": f"{type(e).__name__}: {e}",
-                        }
-
-            sub_overall = sub_qib = sub_nii = sub_rii = None
-            if symbol and status == "OPEN":
-                capture_this_one = subscription_debug is None  # only capture the first attempt, to keep meta small
-                try:
-                    bid_resp = session.get(NSE_IPO_BID_URL, params={"symbol": symbol, "series": "EQ"}, timeout=8)
-                    bid_json = None
-                    if bid_resp.status_code == 200:
-                        try:
-                            bid_json = bid_resp.json()
-                        except Exception:
-                            bid_json = None
-
-                    if capture_this_one:
-                        subscription_debug = {
-                            "symbol": symbol, "url": bid_resp.url, "status_code": bid_resp.status_code,
-                            "raw_json": bid_json,
-                            "raw_text_snippet": bid_resp.text[:1000] if bid_json is None else None,
-                            "exception": None,
-                        }
-
-                    if isinstance(bid_json, dict):
-                        data_list = bid_json.get("dataList", [])
-                        # Confirmed live via the diagnostic panel (not guessed):
-                        # dataList[0] is a HEADER/label row (category="Category",
-                        # etc.) -- skip it. The real rows form a TWO-LEVEL
-                        # hierarchy via "srNo": top-level categories have a
-                        # bare integer srNo ("1"=QIB, "2"=Non-Institutional,
-                        # "3"=Retail, ...), while sub-breakdowns nested under
-                        # them use "1(a)", "2.1", "2.1(a)" etc. Only the
-                        # bare-integer rows are the actual category totals --
-                        # the sub-rows (e.g. "Foreign Institutional
-                        # Investors(FIIs)" under QIB) must NOT be matched as
-                        # their own category, or QIB's number gets overwritten
-                        # by one of its own sub-components.
-                        import re as _re
+                        active_cat = detail_json.get("activeCat", {})
+                        data_list = active_cat.get("dataList", []) if isinstance(active_cat, dict) else []
+                        # Confirmed live: dataList[0] is a HEADER/label row
+                        # (category="Category", etc.) -- skip it. Real rows
+                        # form a TWO-LEVEL hierarchy via "srNo": top-level
+                        # categories have a bare integer srNo ("1"=QIB,
+                        # "2"=Non-Institutional, "3"=Retail, ...), while
+                        # sub-breakdowns nested under them use "1(a)", "2.1",
+                        # "2.1(a)" etc. Only the bare-integer rows are the
+                        # actual category totals -- sub-rows (e.g. "Foreign
+                        # Institutional Investors(FIIs)" under QIB) must NOT
+                        # be matched as their own category.
                         top_level_rows = [
                             r for r in data_list
                             if isinstance(r, dict)
                             and str(r.get("category", "")).strip().upper() != "CATEGORY"
-                            and _re.fullmatch(r"\d+", str(_pick(r, "srNo", default="")).strip())
+                            and re.fullmatch(r"\d+", str(_pick(r, "srNo", default="")).strip())
                         ]
 
                         def _row_times_subscribed(r):
                             # NSE already computes the multiple under
                             # "noOfTotalMeant" (confirmed live) -- prefer it.
-                            # Fall back to bid/offered shares directly if it's
-                            # ever blank for a given row.
+                            # Fall back to bid/offered shares directly if
+                            # it's ever blank for a given row.
                             explicit = _pick(r, "noOfTotalMeant", "noOfTimesSubscribed", "subscriptionTimes")
                             if explicit not in (None, ""):
                                 try:
@@ -1195,23 +1163,74 @@ def get_live_ipo_calendar():
                         # this holds regardless of whether NSE's feed happens
                         # to also send an explicit "Total" row this time (it
                         # doesn't always, based on live testing). Prefer the
-                        # explicit row when NSE does provide one (it may
-                        # include categories like Anchor/Employee this loop
-                        # doesn't otherwise track); otherwise compute it
-                        # directly so "Overall" doesn't go blank just because
-                        # a label happened to be missing from this response.
+                        # explicit row when NSE does provide one; otherwise
+                        # compute it directly so "Overall" doesn't go blank
+                        # just because a label happened to be missing.
                         if explicit_total is not None:
                             sub_overall = explicit_total
                         elif have_valid_share_counts and summed_offered > 0:
                             sub_overall = round(summed_bid / summed_offered, 4)
+
+                        # Lot size and fresh-issue split come from the
+                        # free-text "issueInfo.dataList" -- a list of
+                        # {"title": ..., "value": ...} pairs, NOT a clean
+                        # schema. Confirmed live field names/phrasing:
+                        # "Bid Lot": "84 Equity Shares and in multiples
+                        # thereof", "Issue Size": "...Fresh Issue
+                        # aggregating up to Rs.X million and Offer for Sale
+                        # of up to Y Equity Shares...". The Fresh Issue
+                        # rupee figure is a pre-pricing TARGET (final price
+                        # isn't set yet), so it's not used for the % --
+                        # instead Fresh % is derived purely from share
+                        # counts (Total shares from the calendar endpoint
+                        # minus the OFS share count parsed here), which
+                        # keeps both sides of the subtraction in the same
+                        # unit rather than guessing a conversion price.
+                        issue_info_list = detail_json.get("issueInfo", {}).get("dataList", []) \
+                            if isinstance(detail_json.get("issueInfo"), dict) else []
+
+                        def _issue_info_value(*titles):
+                            for item in issue_info_list:
+                                if isinstance(item, dict) and str(item.get("title") or "").strip() in titles:
+                                    return item.get("value")
+                            return None
+
+                        lot_text = _issue_info_value("Bid Lot", "Minimum Order Quantity")
+                        if lot_text:
+                            m = re.search(r"([\d,]+)\s*Equity Shares", str(lot_text))
+                            if m:
+                                try:
+                                    lot_size = int(m.group(1).replace(",", ""))
+                                except ValueError:
+                                    lot_size = None
+
+                        issue_structure_text = _issue_info_value("Issue Size")
+                        if issue_structure_text:
+                            m = re.search(r"Offer for Sale of up to\s*([\d,]+)\s*Equity Shares",
+                                           str(issue_structure_text), re.IGNORECASE)
+                            try:
+                                if m and issue_size not in (None, 0, "0", ""):
+                                    ofs_shares = int(m.group(1).replace(",", ""))
+                                    total_shares = float(str(issue_size).replace(",", ""))
+                                    fresh_shares = total_shares - ofs_shares
+                                    if total_shares > 0 and fresh_shares >= 0:
+                                        fresh_issue_pct = round((fresh_shares / total_shares) * 100, 1)
+                                elif "entirely" in str(issue_structure_text).lower() and "fresh issue" in str(issue_structure_text).lower() \
+                                        and "offer for sale" not in str(issue_structure_text).lower():
+                                    fresh_issue_pct = 100.0
+                                elif "entirely" in str(issue_structure_text).lower() and "offer for sale" in str(issue_structure_text).lower() \
+                                        and "fresh issue" not in str(issue_structure_text).lower():
+                                    fresh_issue_pct = 0.0
+                            except (TypeError, ValueError):
+                                fresh_issue_pct = None
                 except Exception as e:
                     if capture_this_one:
-                        subscription_debug = {
-                            "symbol": symbol, "url": NSE_IPO_BID_URL, "status_code": None,
+                        detail_debug = {
+                            "symbol": symbol, "url": NSE_IPO_DETAIL_URL, "status_code": None,
                             "raw_json": None, "raw_text_snippet": None,
                             "exception": f"{type(e).__name__}: {e}",
                         }
-                    pass  # subscription is best-effort; the calendar row still stands without it
+                    pass  # subscription/lot-size is best-effort; the calendar row still stands without it
 
             def _num(v):
                 try:
@@ -1243,7 +1262,6 @@ def get_live_ipo_calendar():
     meta = {
         "ok": True, "error": None, "as_of": as_of,
         "attempted": len(raw_rows), "succeeded": len(processed), "skipped": skipped,
-        "subscription_debug": subscription_debug,
         "detail_debug": detail_debug,
         "calendar_row_sample": raw_rows[0] if raw_rows else None,
     }

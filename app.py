@@ -645,40 +645,6 @@ with tab2:
 
         render_skip_report(ipo_meta, label="IPO listings")
 
-        # Lot Size / Fresh Issue % come from a SEPARATE per-symbol detail
-        # endpoint now (confirmed the calendar endpoint's row never has
-        # them at all -- see get_live_ipo_calendar's module note). Surface
-        # that endpoint's raw response if they're still not populating, so
-        # a wrong field-name guess is visible instead of a bare "—".
-        lot_size_unavailable = (
-            reco_df["Lot Size"].astype(str).str.contains("Not published", na=False).all()
-            if "Lot Size" in reco_df.columns else True
-        )
-        detail_debug = ipo_meta.get("detail_debug")
-        if detail_debug and lot_size_unavailable:
-            with st.expander("🔍 Diagnostic: per-symbol IPO detail fetch (Lot Size / Fresh Issue % still unavailable)"):
-                st.write(f"**Symbol tested:** {detail_debug.get('symbol')}")
-                st.write(f"**URL called:** {detail_debug.get('url')}")
-                st.write(f"**HTTP status:** {detail_debug.get('status_code')}")
-                if detail_debug.get("exception"):
-                    st.error(f"Request failed: {detail_debug['exception']}")
-                elif detail_debug.get("raw_json") is not None:
-                    st.json(detail_debug["raw_json"])
-                elif detail_debug.get("raw_text_snippet"):
-                    st.code(detail_debug["raw_text_snippet"], language="text")
-                else:
-                    st.warning(
-                        "This endpoint returned nothing usable. It's possible NSE simply doesn't publish "
-                        "lot size or the fresh-issue split anywhere in a free API — at that point it's not "
-                        "worth chasing further, and the app will keep showing \"Not published by NSE's "
-                        "public feed\" honestly rather than guessing."
-                    )
-                st.caption(
-                    "Share this output (or confirm it's empty/404) to either fix the mapping or confirm "
-                    "this data just isn't publicly available."
-                )
-
-
         # If NSE's response came back non-empty but nothing actually parsed
         # (schema drift on their unofficial API), surface the raw payload
         # instead of silently showing an empty/wrong table.
@@ -691,33 +657,45 @@ with tab2:
                     "get the field-mapping corrected."
                 )
 
-        # Subscription (QIB/NII/RII) came back empty for every open issue —
-        # show exactly what NSE's bid-detail endpoint actually returned for
-        # the first attempt, so the field-mapping can be fixed from real
-        # data instead of another guess.
-        sub_debug = ipo_meta.get("subscription_debug")
+        # Subscription (QIB/NII/RII) and Lot Size / Fresh Issue % all come
+        # from ONE endpoint now (ipo-detail). Surface its raw response if
+        # any of those fields are still coming up universally blank, so a
+        # wrong field-name guess is visible instead of another silent gap.
+        detail_debug = ipo_meta.get("detail_debug")
         any_open = (reco_df["Status"] == "OPEN").any() if not reco_df.empty else False
         qib_missing = reco_df["Sub — QIB (x)"].isna().all() if "Sub — QIB (x)" in reco_df.columns else True
         nii_missing = reco_df["Sub — NII/HNI (x)"].isna().all() if "Sub — NII/HNI (x)" in reco_df.columns else True
-        # Trigger on EITHER field being universally blank -- QIB working
-        # while NII doesn't (or vice versa) is just as much a real mapping
-        # gap as both being blank, and deserves the same raw-data check.
-        if sub_debug and any_open and (qib_missing or nii_missing):
-            with st.expander("🔍 Diagnostic: live subscription fetch (QIB and/or NII/HNI not populating)"):
-                st.write(f"**Symbol tested:** {sub_debug.get('symbol')}")
-                st.write(f"**URL called:** {sub_debug.get('url')}")
-                st.write(f"**HTTP status:** {sub_debug.get('status_code')}")
-                st.write(f"**QIB missing across all rows:** {qib_missing} · **NII/HNI missing across all rows:** {nii_missing}")
-                if sub_debug.get("exception"):
-                    st.error(f"Request failed: {sub_debug['exception']}")
-                elif sub_debug.get("raw_json") is not None:
-                    st.json(sub_debug["raw_json"])
-                elif sub_debug.get("raw_text_snippet"):
-                    st.code(sub_debug["raw_text_snippet"], language="text")
-                st.caption(
-                    "This is NSE's actual response for the subscription endpoint this tool guessed at. "
-                    "Share this output to get the field-mapping (or the endpoint itself) corrected."
+        lot_size_unavailable = (
+            reco_df["Lot Size"].astype(str).str.contains("Not published", na=False).all()
+            if "Lot Size" in reco_df.columns else True
+        )
+        if detail_debug and any_open and (qib_missing or nii_missing or lot_size_unavailable):
+            with st.expander("🔍 Diagnostic: live IPO detail fetch (subscription / Lot Size / Fresh Issue % gaps)"):
+                st.write(f"**Symbol tested:** {detail_debug.get('symbol')}")
+                st.write(f"**URL called:** {detail_debug.get('url')}")
+                st.write(f"**HTTP status:** {detail_debug.get('status_code')}")
+                st.write(
+                    f"**QIB missing:** {qib_missing} · **NII/HNI missing:** {nii_missing} · "
+                    f"**Lot Size unavailable:** {lot_size_unavailable}"
                 )
+                if detail_debug.get("exception"):
+                    st.error(f"Request failed: {detail_debug['exception']}")
+                elif detail_debug.get("raw_json") is not None:
+                    st.json(detail_debug["raw_json"])
+                elif detail_debug.get("raw_text_snippet"):
+                    st.code(detail_debug["raw_text_snippet"], language="text")
+                else:
+                    st.warning(
+                        "This endpoint returned nothing usable. It's possible NSE simply doesn't publish "
+                        "some of this data anywhere in a free API — at that point it's not worth chasing "
+                        "further, and the app will keep showing \"Not published by NSE's public feed\" "
+                        "honestly rather than guessing."
+                    )
+                st.caption(
+                    "This is NSE's actual response for the endpoint this tool uses. Share this output to "
+                    "get the field-mapping corrected, or to confirm the gap is a real data limitation."
+                )
+
 # =============================================================================
 # TAB 3: CORE MUTUAL FUND QUALIFIER
 # =============================================================================
