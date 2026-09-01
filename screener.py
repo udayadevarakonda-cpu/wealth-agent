@@ -1070,29 +1070,35 @@ def get_live_ipo_calendar():
 
                     if isinstance(bid_json, dict):
                         data_list = bid_json.get("dataList", [])
-                        # NSE's first dataList element is a HEADER/label row
-                        # (category="Category", noOfShareOffered="No.of shares
-                        # offered/reserved", ...) describing what each key
-                        # means -- confirmed via the live diagnostic panel,
-                        # not guessed. Real rows (QIB/NII/RII/Total/...)
-                        # follow it; skip anything whose category is
-                        # literally the label "Category".
-                        data_rows = [
+                        # Confirmed live via the diagnostic panel (not guessed):
+                        # dataList[0] is a HEADER/label row (category="Category",
+                        # etc.) -- skip it. The real rows form a TWO-LEVEL
+                        # hierarchy via "srNo": top-level categories have a
+                        # bare integer srNo ("1"=QIB, "2"=Non-Institutional,
+                        # "3"=Retail, ...), while sub-breakdowns nested under
+                        # them use "1(a)", "2.1", "2.1(a)" etc. Only the
+                        # bare-integer rows are the actual category totals --
+                        # the sub-rows (e.g. "Foreign Institutional
+                        # Investors(FIIs)" under QIB) must NOT be matched as
+                        # their own category, or QIB's number gets overwritten
+                        # by one of its own sub-components.
+                        import re as _re
+                        top_level_rows = [
                             r for r in data_list
-                            if isinstance(r, dict) and str(r.get("category", "")).strip().upper() != "CATEGORY"
+                            if isinstance(r, dict)
+                            and str(r.get("category", "")).strip().upper() != "CATEGORY"
+                            and _re.fullmatch(r"\d+", str(_pick(r, "srNo", default="")).strip())
                         ]
 
                         def _row_times_subscribed(r):
-                            # Prefer an explicit "times subscribed" field if
-                            # NSE provides one under some field name; otherwise
-                            # compute it directly from shares bid / shares
-                            # offered -- the actual definition of the
-                            # subscription multiple, so this works even if
-                            # NSE never exposes a precomputed ratio field.
-                            explicit = _pick(r, "noOfTimesSubscribed", "subscriptionTimes", "noOfTimeSubscribed")
+                            # NSE already computes the multiple under
+                            # "noOfTotalMeant" (confirmed live) -- prefer it.
+                            # Fall back to bid/offered shares directly if it's
+                            # ever blank for a given row.
+                            explicit = _pick(r, "noOfTotalMeant", "noOfTimesSubscribed", "subscriptionTimes")
                             if explicit not in (None, ""):
                                 try:
-                                    return float(str(explicit).replace(",", ""))
+                                    return round(float(str(explicit).replace(",", "")), 4)
                                 except (TypeError, ValueError):
                                     pass
                             bid_shares = _pick(r, "noOfSharesBid", "noOfSharesBidFor")
@@ -1101,24 +1107,28 @@ def get_live_ipo_calendar():
                                 bid_shares = float(str(bid_shares).replace(",", ""))
                                 offered_shares = float(str(offered_shares).replace(",", ""))
                                 if offered_shares > 0:
-                                    return round(bid_shares / offered_shares, 2)
+                                    return round(bid_shares / offered_shares, 4)
                             except (TypeError, ValueError):
                                 pass
                             return None
 
-                        for r in data_rows:
+                        for r in top_level_rows:
                             cat_name = str(_pick(r, "category", default="")).upper()
                             times = _row_times_subscribed(r)
                             if times is None:
                                 continue
-                            if "QIB" in cat_name and sub_qib is None:
-                                sub_qib = times
-                            elif ("NII" in cat_name or "HNI" in cat_name or "NON-INSTITUTIONAL" in cat_name) and sub_nii is None:
-                                sub_nii = times
-                            elif ("RII" in cat_name or "RETAIL" in cat_name) and sub_rii is None:
-                                sub_rii = times
-                            elif "TOTAL" in cat_name and sub_overall is None:
-                                sub_overall = times
+                            if "QIB" in cat_name or ("QUALIFIED" in cat_name and "INSTITUTIONAL" in cat_name):
+                                if sub_qib is None:
+                                    sub_qib = times
+                            elif "NON" in cat_name and "INSTITUTIONAL" in cat_name:
+                                if sub_nii is None:
+                                    sub_nii = times
+                            elif "RII" in cat_name or "RETAIL" in cat_name:
+                                if sub_rii is None:
+                                    sub_rii = times
+                            elif "TOTAL" in cat_name:
+                                if sub_overall is None:
+                                    sub_overall = times
                 except Exception as e:
                     if capture_this_one:
                         subscription_debug = {

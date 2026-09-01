@@ -467,6 +467,123 @@ with tab2:
     st.markdown("---")
 
     # =============================================================================
+    # ON-DEMAND SCREENER — single ticker / ETF / AMFI scheme lookup
+    # =============================================================================
+    st.subheader("🔎 On-Demand Screener")
+    st.caption("Look up any single NSE ticker, ETF, or AMFI mutual fund scheme code for an instant verdict.")
+
+    col_s1, col_s2 = st.columns([3, 1])
+    with col_s1:
+        searched_ticker = st.text_input(
+            "Enter Ticker, ETF, or AMFI Scheme Code (e.g. INFY, NIFTYBEES, 119062):",
+            key="ondemand_ticker_input"
+        )
+    with col_s2:
+        st.write("")
+        st.write("")
+        analyze_btn = st.button("🚀 Analyze Asset", use_container_width=True)
+
+    # Store the result together with the exact query it was computed for --
+    # otherwise editing the text box without re-clicking would silently keep
+    # showing a PREVIOUS query's result next to the NEW text typed in.
+    if analyze_btn and searched_ticker:
+        with st.spinner(f"Analyzing {searched_ticker.upper()}..."):
+            res = cached_single_asset(searched_ticker.strip(), st.session_state.refresh_counter)
+        st.session_state["last_analyzed_query"] = searched_ticker.strip()
+        st.session_state["last_analyzed_result"] = res
+
+    stored_query = st.session_state.get("last_analyzed_query")
+    res = st.session_state.get("last_analyzed_result")
+
+    if res is not None and stored_query:
+        st.caption(f"Showing result for: **{stored_query}**")
+        if searched_ticker.strip() and searched_ticker.strip() != stored_query:
+            st.info(f"ℹ️ The box currently shows a different value (**{searched_ticker.strip()}**) — click **Analyze Asset** to search for it.")
+
+        if "error" in res:
+            st.error(f"❌ {res['error']}")
+        elif res.get("asset_type") == "mutual_fund":
+            st.info("ℹ️ " + res.get("methodology_note", ""))
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Latest NAV", f"₹{res['ltp']:,.2f}")
+            k2.metric("200-Day EMA (NAV)", f"₹{res['ema_200']:,.2f}", delta="Above" if res["above_ema"] else "Below")
+            k3.metric("3M Return", f"{res['ret_3m_pct']}%" if res["ret_3m_pct"] is not None else "—")
+            k4.metric("6M Return", f"{res['ret_6m_pct']}%" if res["ret_6m_pct"] is not None else "—")
+
+            if res["verdict"] == "GREEN":
+                st.success(f"### {res['verdict_text']}")
+            elif res["verdict"] == "YELLOW":
+                st.warning(f"### {res['verdict_text']}")
+            else:
+                st.error(f"### {res['verdict_text']}")
+
+            st.markdown("##### 📌 Recommendation")
+            rec_colors = {"GREEN": st.success, "YELLOW": st.warning, "RED": st.error}
+            rec_fn = rec_colors.get(res["verdict"], st.info)
+            rec_fn(f"**{res.get('recommendation', '—')}**")
+
+            exit_labels = {
+                "HOLD": "✅ Trend Status: NO ACTION NEEDED",
+                "MONITOR": "🟡 Trend Status: WATCH CLOSELY",
+                "REVIEW": "🔴 Trend Status: REVIEW THIS HOLDING",
+            }
+            exit_signal = res.get("exit_signal", "")
+            status_label = exit_labels.get(exit_signal, f"Trend Status: {exit_signal}")
+            if exit_signal == "REVIEW":
+                st.error(f"**{status_label}**\n\n{res.get('exit_note', '')}")
+            elif exit_signal == "MONITOR":
+                st.warning(f"**{status_label}**\n\n{res.get('exit_note', '')}")
+            else:
+                st.success(f"**{status_label}**\n\n{res.get('exit_note', '')}")
+        else:
+            k1, k2, k3, k4, k5 = st.columns(5)
+            k1.metric("LTP", f"₹{res['ltp']:,.2f}", help=f"As of {res.get('as_of', '—')}")
+            k2.metric("SuperTrend", "🟢 Bullish" if res["st_bullish"] else "🔴 Bearish")
+            k3.metric("ADX", f"{res['adx']:.1f}")
+            k4.metric("200 EMA", f"₹{res['ema_200']:,.2f}", delta="Above" if res["above_ema"] else "Below")
+            k5.metric("Dynamic Stop", f"₹{res['dynamic_stop']:,.2f}", f"{res['risk_to_stop']}%")
+
+            if res["verdict"] == "GREEN":
+                st.success(f"### {res['verdict_text']}")
+            elif res["verdict"] == "YELLOW":
+                st.warning(f"### {res['verdict_text']}")
+            else:
+                st.error(f"### {res['verdict_text']}")
+
+            st.markdown("##### 📌 Recommendation")
+            rec_colors = {"GREEN": st.success, "YELLOW": st.warning, "RED": st.error}
+            rec_fn = rec_colors.get(res["verdict"], st.info)
+            rec_fn(f"**{res.get('recommendation', '—')}**\n\n{res.get('recommendation_note', '')}")
+
+            st.markdown("##### 🎯 Risk-Based Position Sizing")
+            st.caption(
+                "The dynamic stop tells you WHERE to exit. This tells you HOW MANY shares to buy "
+                "so that hitting the stop only costs you a fixed, chosen amount of capital — "
+                "instead of sizing the position off gut feel."
+            )
+            risk_col1, risk_col2 = st.columns([1, 2])
+            with risk_col1:
+                risk_amount = st.number_input(
+                    "Rupees you're willing to lose on this trade if the stop is hit (₹)",
+                    min_value=100.0,
+                    max_value=float(tactical_satellite_alloc) if tactical_satellite_alloc > 0 else 100000.0,
+                    value=min(2500.0, max(100.0, tactical_satellite_alloc * 0.1)) if tactical_satellite_alloc > 0 else 2500.0,
+                    step=250.0,
+                    key="risk_amount_input"
+                )
+            with risk_col2:
+                per_share_risk = res["ltp"] - res["dynamic_stop"]
+                if per_share_risk > 0:
+                    suggested_qty = int(risk_amount / per_share_risk)
+                    suggested_capital = round(suggested_qty * res["ltp"], 2)
+                    st.metric("Suggested Quantity", f"{suggested_qty} shares", help=f"Risk per share: ₹{per_share_risk:,.2f}")
+                    st.caption(f"≈ ₹{suggested_capital:,.2f} deployed — if the dynamic stop is hit, realized loss ≈ ₹{round(suggested_qty * per_share_risk, 2):,.2f} (before brokerage/taxes).")
+                else:
+                    st.info("Stop is at or above current LTP — sizing math doesn't apply here (verify the SuperTrend/stop values before considering entry).")
+
+    st.markdown("---")
+
+    # =============================================================================
     # LIVE IPO CALENDAR (TAB 2) — real NSE data, nothing hardcoded
     # =============================================================================
     st.markdown("---")
