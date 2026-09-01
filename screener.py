@@ -1036,6 +1036,7 @@ def get_live_ipo_calendar():
                 status = "UNKNOWN"
 
             days_to_close = (end_date - today).days if (end_date and status == "OPEN") else None
+            window_days = (end_date - start_date).days + 1 if (start_date and end_date) else None
 
             price_band = _pick(row, "issuePrice", "priceBand", "price")
             issue_size = _pick(row, "issueSize", "totalIssueSize")
@@ -1275,6 +1276,7 @@ def get_live_ipo_calendar():
                 "Issue Opens": start_date.strftime("%d-%b-%Y") if start_date else "—",
                 "Issue Closes": end_date.strftime("%d-%b-%Y") if end_date else "—",
                 "Days to Close": days_to_close,
+                "Window Days": window_days,
                 "Price Band": str(price_band) if price_band else "—",
                 "Lot Size": lot_size if lot_size else "Not published by NSE's public feed",
                 "Issue Size": issue_size or "—",
@@ -1302,19 +1304,37 @@ def build_ipo_recommendation(df):
     """
     A rule-based Apply/Watch/Avoid read, built ONLY from parameters that
     are actually live-sourced in get_live_ipo_calendar() -- subscription
-    by category (Overall / QIB / NII / RII) and Fresh Issue %. No GMP, no
-    peer P/E, no RoCE: see the module note above for why those stay out
-    rather than being estimated.
+    by category (Overall / QIB / NII / RII), Fresh Issue %, and where the
+    issue currently sits in its bidding window. No GMP, no peer P/E, no
+    RoCE: see the module note above for why those stay out rather than
+    being estimated.
 
-    Why these specific parameters: QIB (institutional) subscription is
-    the single most literature-backed FREE, LIVE signal of post-listing
-    performance -- institutions do real diligence before bidding, unlike
-    retail. A wide gap between strong retail demand and weak QIB demand
-    is a well-documented caution pattern (retail-driven hype without
-    institutional confirmation), not something invented for this tool.
-    Fresh Issue % matters because money raised via fresh shares funds the
-    company's growth, while a high Offer-For-Sale share mostly cashes out
-    existing promoters/investors -- a standard, non-fabricated heuristic.
+    Why these specific parameters:
+      - QIB (institutional) subscription is the primary driver -- the
+        single most literature-backed FREE, LIVE signal of post-listing
+        performance, since institutions do real diligence before bidding.
+      - NII/HNI subscription is a SECONDARY, lower-trust signal. A large
+        share of NII bids are financed (HNIs borrowing specifically to
+        apply for listing-day gains, via NBFC/broker funding) -- so a high
+        NII multiple without QIB backing doesn't carry the same diligence
+        signal, and financed positions tend to sell fast post-listing,
+        which can add to listing-day volatility rather than reflect
+        durable demand. This is standard, well-documented Indian IPO
+        market behavior, not something invented for this tool -- it's WHY
+        NII gets its own divergence check below rather than being averaged
+        in with QIB as if the two meant the same thing.
+      - RII (retail) divergence: a wide gap between strong retail demand
+        and weak QIB demand is a well-documented caution pattern.
+      - Fresh Issue % matters because money raised via fresh shares funds
+        the company's growth, while a high Offer-For-Sale share mostly
+        cashes out existing promoters/investors.
+      - Day-in-bidding-cycle: QIB and NII demand is famously concentrated
+        on the FINAL day of bidding (institutions and big-ticket HNIs wait
+        to see how the issue is trending before committing) -- so a WEAK
+        reading on Day 1 of 3 means "too early to tell," while the same
+        reading on the final day is a much more settled signal. Every
+        note below is tagged with where the issue sits in its window so
+        this isn't lost.
 
     This is a RULE, not a guarantee -- it reads exactly like the
     recommendation/recommendation_note pattern already used for stocks
@@ -1331,18 +1351,21 @@ def build_ipo_recommendation(df):
     def _reco(row):
         inputs_used = []
         if row["Status"] != "OPEN":
-            return "⚪ CALENDAR ONLY", "Bidding hasn't opened yet — no live demand data to assess.", "0/2"
+            return "⚪ CALENDAR ONLY", "Bidding hasn't opened yet — no live demand data to assess.", "0/3"
 
         qib, overall = row.get("Sub — QIB (x)"), row.get("Sub — Overall (x)")
         rii = row.get("Sub — RII (x)")
+        nii = row.get("Sub — NII/HNI (x)")
         fresh_pct = row.get("Fresh Issue (%)")
         fresh_pct = fresh_pct if isinstance(fresh_pct, (int, float)) else None  # may be a "not published" label string
 
         if qib is not None:
             inputs_used.append("QIB subscription")
+        if nii is not None:
+            inputs_used.append("NII/HNI subscription")
         if fresh_pct is not None:
             inputs_used.append("Fresh Issue %")
-        completeness = f"{len(inputs_used)}/2 live inputs"
+        completeness = f"{len(inputs_used)}/3 live inputs"
 
         if qib is None and overall is None:
             return "⚪ CALENDAR ONLY", "Issue is open, but NSE hasn't returned a subscription figure yet — check back closer to close.", completeness
@@ -1354,6 +1377,8 @@ def build_ipo_recommendation(df):
                 label, note = "🟡 MODERATE — Some Institutional Interest", f"QIB subscribed {qib}x — decent but not standout institutional demand."
             elif rii is not None and rii >= 5 and qib < 1:
                 label, note = "🟠 CAUTION — Retail-Driven, Weak Institutional Backing", f"Retail is {rii}x subscribed but QIB is only {qib}x — a known divergence pattern where retail enthusiasm isn't confirmed by institutional diligence."
+            elif nii is not None and nii >= 20 and qib < 3:
+                label, note = "🟠 CAUTION — Leveraged HNI Demand, Weak Institutional Backing", f"NII/HNI is {nii}x subscribed but QIB is only {qib}x — NII bids are often financed (HNIs borrowing to chase listing-day gains), so this doesn't carry the same diligence signal QIB does, and financed positions often sell fast post-listing."
             else:
                 label, note = "🔴 WEAK — Limited Institutional Interest", f"QIB subscribed only {qib}x so far."
         else:
@@ -1365,11 +1390,27 @@ def build_ipo_recommendation(df):
             else:
                 label, note = "🔴 WEAK — Limited Demand So Far", f"Overall subscription only {overall}x."
 
+        # NII reinforcement note when it ISN'T already the reason for the
+        # label above (avoids saying the same thing twice for the leveraged-
+        # HNI caution case).
+        if nii is not None and "Leveraged HNI" not in label and qib is not None and qib >= 3 and nii >= 10:
+            note += f" NII/HNI is also strong at {nii}x, reinforcing the institutional read."
+
         if fresh_pct is not None:
             if fresh_pct < 30:
                 note += f" Fresh issue is only {fresh_pct}% of the raise — most proceeds are an existing-investor exit (OFS), not growth capital."
             else:
                 note += f" Fresh issue is {fresh_pct}% of the raise, funding the company itself rather than mostly an OFS exit."
+
+        # Day-in-bidding-cycle context: a WEAK/CAUTION read on Day 1 means
+        # "too early to tell" far more than the same read on the final day.
+        window_days, days_to_close = row.get("Window Days"), row.get("Days to Close")
+        if window_days and days_to_close is not None:
+            day_num = window_days - days_to_close
+            if days_to_close == 0:
+                note += f" (Day {day_num} of {window_days} — closes today; this is close to the final, most reliable reading.)"
+            else:
+                note += f" (Day {day_num} of {window_days} — QIB/NII demand typically concentrates on the final day, so this can still shift a lot.)"
 
         return label, note, completeness
 
