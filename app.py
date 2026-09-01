@@ -645,6 +645,21 @@ with tab2:
 
         render_skip_report(ipo_meta, label="IPO listings")
 
+        # Lot Size (and possibly Fresh Issue %) showing "—" for every row
+        # means those field names were guessed wrong too -- same class of
+        # issue as the subscription endpoint. Surface the raw calendar row
+        # so the mapping can be fixed from real data, not another guess.
+        lot_size_all_missing = (reco_df["Lot Size"] == "—").all() if "Lot Size" in reco_df.columns else True
+        calendar_sample = ipo_meta.get("calendar_row_sample")
+        if calendar_sample and lot_size_all_missing:
+            with st.expander("🔍 Diagnostic: raw NSE calendar row (Lot Size / Fresh Issue % not populating)"):
+                st.json(calendar_sample)
+                st.caption(
+                    "This is one full, real row from NSE's upcoming-issues response. Share this to get "
+                    "the Lot Size, Issue Size, and Fresh Issue % field-mapping corrected."
+                )
+
+
         # If NSE's response came back non-empty but nothing actually parsed
         # (schema drift on their unofficial API), surface the raw payload
         # instead of silently showing an empty/wrong table.

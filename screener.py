@@ -1169,6 +1169,7 @@ def get_live_ipo_calendar():
         "ok": True, "error": None, "as_of": as_of,
         "attempted": len(raw_rows), "succeeded": len(processed), "skipped": skipped,
         "subscription_debug": subscription_debug,
+        "calendar_row_sample": raw_rows[0] if raw_rows else None,
     }
     return df, raw_rows, meta
 
