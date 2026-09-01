@@ -1009,6 +1009,7 @@ def get_live_ipo_calendar():
     today = _dt.date.today()
     processed, skipped = [], []
     detail_debug = None  # captures the FIRST live per-symbol ipo-detail attempt (subscription + lot size + fresh issue)
+    fresh_issue_text_samples = []  # (symbol, raw "Issue Size" text, parsed %) for EVERY open issue -- cheap, already in memory
 
     for row in raw_rows:
         try:
@@ -1223,6 +1224,12 @@ def get_live_ipo_calendar():
                                     fresh_issue_pct = 0.0
                             except (TypeError, ValueError):
                                 fresh_issue_pct = None
+
+                        if issue_structure_text:
+                            fresh_issue_text_samples.append({
+                                "symbol": symbol, "issue_size_text": issue_structure_text,
+                                "parsed_fresh_pct": fresh_issue_pct,
+                            })
                 except Exception as e:
                     if capture_this_one:
                         detail_debug = {
@@ -1263,6 +1270,7 @@ def get_live_ipo_calendar():
         "ok": True, "error": None, "as_of": as_of,
         "attempted": len(raw_rows), "succeeded": len(processed), "skipped": skipped,
         "detail_debug": detail_debug,
+        "fresh_issue_text_samples": fresh_issue_text_samples,
         "calendar_row_sample": raw_rows[0] if raw_rows else None,
     }
     return df, raw_rows, meta

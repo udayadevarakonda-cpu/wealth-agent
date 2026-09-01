@@ -696,6 +696,30 @@ with tab2:
                     "get the field-mapping corrected, or to confirm the gap is a real data limitation."
                 )
 
+        # Fresh Issue % specifically -- it parses the free-text "Issue Size"
+        # description, and different companies phrase that differently (OFS
+        # stated in rupees instead of share count, different wording, etc.).
+        # The main diagnostic above won't fire once QIB/NII/Lot Size are all
+        # populated, so this checks Fresh Issue % on its own and shows the
+        # RAW text for whichever issues didn't parse -- cheap to capture
+        # since it's already fetched, no extra request needed.
+        fresh_issue_unavailable = (
+            reco_df["Fresh Issue (%)"].astype(str).str.contains("Not published", na=False).any()
+            if "Fresh Issue (%)" in reco_df.columns else False
+        )
+        fresh_samples = ipo_meta.get("fresh_issue_text_samples") or []
+        if fresh_issue_unavailable and fresh_samples:
+            with st.expander("🔍 Diagnostic: raw \"Issue Size\" text for Fresh Issue % (some issues not parsing)"):
+                for s in fresh_samples:
+                    status_icon = "✅" if s["parsed_fresh_pct"] is not None else "❌"
+                    st.write(f"{status_icon} **{s['symbol']}** — parsed: {s['parsed_fresh_pct']}")
+                    st.code(s["issue_size_text"], language="text")
+                st.caption(
+                    "Share the ❌ rows' raw text to get the phrasing pattern added — different companies "
+                    "describe Fresh Issue / Offer-for-Sale differently (e.g. OFS stated in rupees instead "
+                    "of a share count), which the current parser doesn't yet cover."
+                )
+
 # =============================================================================
 # TAB 3: CORE MUTUAL FUND QUALIFIER
 # =============================================================================
