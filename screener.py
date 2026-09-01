@@ -934,6 +934,7 @@ def compute_adx_series(df, period=14):
 NSE_HOME_URL = "https://www.nseindia.com/"
 NSE_IPO_API_URL = "https://www.nseindia.com/api/all-upcoming-issues?category=ipo"
 NSE_IPO_BID_URL = "https://www.nseindia.com/api/ipo-active-category"
+NSE_IPO_DETAIL_URL = "https://www.nseindia.com/api/ipo-detail"
 
 _NSE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -1008,6 +1009,7 @@ def get_live_ipo_calendar():
     today = _dt.date.today()
     processed, skipped = [], []
     subscription_debug = None  # captures the FIRST live subscription attempt, whatever the outcome
+    detail_debug = None  # captures the FIRST live per-symbol detail attempt (lot size / fresh issue)
 
     for row in raw_rows:
         try:
@@ -1036,17 +1038,56 @@ def get_live_ipo_calendar():
             days_to_close = (end_date - today).days if (end_date and status == "OPEN") else None
 
             price_band = _pick(row, "issuePrice", "priceBand", "price")
-            lot_size = _pick(row, "lotSize", "marketLot")
             issue_size = _pick(row, "issueSize", "totalIssueSize")
-            fresh_issue_pct = _pick(row, "freshIssuePercent", "freshIssuePct")
-            if fresh_issue_pct is None:
-                fresh_amt = _pick(row, "freshIssueSize", "freshIssueAmount")
-                total_amt = _pick(row, "issueSize", "totalIssueSize")
+
+            # Lot size and fresh-issue split are NOT present in the calendar
+            # endpoint's row at all (confirmed live -- the full raw row was
+            # inspected and neither field exists there). Try ONE additional
+            # per-symbol detail endpoint that sometimes carries this, same
+            # unverified-but-plausible basis as the other two endpoints this
+            # tool guessed correctly. Captured via its own diagnostic below
+            # so a wrong guess here is visible, not silently wrong.
+            lot_size = None
+            fresh_issue_pct = None
+            detail_capture_this_one = detail_debug is None
+            if symbol:
                 try:
-                    if fresh_amt is not None and total_amt not in (None, 0, "0"):
-                        fresh_issue_pct = round((float(fresh_amt) / float(total_amt)) * 100, 1)
-                except (TypeError, ValueError, ZeroDivisionError):
-                    fresh_issue_pct = None
+                    detail_resp = session.get(NSE_IPO_DETAIL_URL, params={"symbol": symbol, "series": "EQ"}, timeout=8)
+                    detail_json = None
+                    if detail_resp.status_code == 200:
+                        try:
+                            detail_json = detail_resp.json()
+                        except Exception:
+                            detail_json = None
+
+                    if detail_capture_this_one:
+                        detail_debug = {
+                            "symbol": symbol, "url": detail_resp.url, "status_code": detail_resp.status_code,
+                            "raw_json": detail_json,
+                            "raw_text_snippet": detail_resp.text[:1000] if detail_json is None else None,
+                            "exception": None,
+                        }
+
+                    if isinstance(detail_json, dict):
+                        detail_data = detail_json if "lotSize" in detail_json or "marketLot" in detail_json else detail_json.get("data", detail_json)
+                        lot_size = _pick(detail_data, "lotSize", "marketLot", "minBidQuantity", "minLotSize")
+                        fresh_amt = _pick(detail_data, "freshIssueSize", "freshIssueAmount", "freshIssue")
+                        ofs_amt = _pick(detail_data, "offerForSaleSize", "ofsSize", "offerForSale")
+                        total_amt = issue_size
+                        try:
+                            if fresh_amt is not None and total_amt not in (None, 0, "0", ""):
+                                fresh_issue_pct = round((float(fresh_amt) / float(total_amt)) * 100, 1)
+                            elif fresh_amt is not None and ofs_amt is not None:
+                                fresh_issue_pct = round((float(fresh_amt) / (float(fresh_amt) + float(ofs_amt))) * 100, 1)
+                        except (TypeError, ValueError, ZeroDivisionError):
+                            fresh_issue_pct = None
+                except Exception as e:
+                    if detail_capture_this_one:
+                        detail_debug = {
+                            "symbol": symbol, "url": NSE_IPO_DETAIL_URL, "status_code": None,
+                            "raw_json": None, "raw_text_snippet": None,
+                            "exception": f"{type(e).__name__}: {e}",
+                        }
 
             sub_overall = sub_qib = sub_nii = sub_rii = None
             if symbol and status == "OPEN":
@@ -1112,9 +1153,28 @@ def get_live_ipo_calendar():
                                 pass
                             return None
 
+                        def _row_shares(r):
+                            """Raw (bid, offered) share counts for a row, or (None, None)."""
+                            try:
+                                bid_shares = float(str(_pick(r, "noOfSharesBid", "noOfSharesBidFor")).replace(",", ""))
+                                offered_shares = float(str(_pick(r, "noOfShareOffered", "noOfSharesOffered")).replace(",", ""))
+                                return bid_shares, offered_shares
+                            except (TypeError, ValueError):
+                                return None, None
+
+                        explicit_total = None
+                        summed_bid, summed_offered = 0.0, 0.0
+                        have_valid_share_counts = False
+
                         for r in top_level_rows:
                             cat_name = str(_pick(r, "category", default="")).upper()
                             times = _row_times_subscribed(r)
+                            bid_shares, offered_shares = _row_shares(r)
+                            if bid_shares is not None and offered_shares is not None and offered_shares > 0:
+                                summed_bid += bid_shares
+                                summed_offered += offered_shares
+                                have_valid_share_counts = True
+
                             if times is None:
                                 continue
                             if "QIB" in cat_name or ("QUALIFIED" in cat_name and "INSTITUTIONAL" in cat_name):
@@ -1127,8 +1187,23 @@ def get_live_ipo_calendar():
                                 if sub_rii is None:
                                     sub_rii = times
                             elif "TOTAL" in cat_name:
-                                if sub_overall is None:
-                                    sub_overall = times
+                                if explicit_total is None:
+                                    explicit_total = times
+
+                        # "Overall" is mathematically total shares bid / total
+                        # shares offered across every top-level category --
+                        # this holds regardless of whether NSE's feed happens
+                        # to also send an explicit "Total" row this time (it
+                        # doesn't always, based on live testing). Prefer the
+                        # explicit row when NSE does provide one (it may
+                        # include categories like Anchor/Employee this loop
+                        # doesn't otherwise track); otherwise compute it
+                        # directly so "Overall" doesn't go blank just because
+                        # a label happened to be missing from this response.
+                        if explicit_total is not None:
+                            sub_overall = explicit_total
+                        elif have_valid_share_counts and summed_offered > 0:
+                            sub_overall = round(summed_bid / summed_offered, 4)
                 except Exception as e:
                     if capture_this_one:
                         subscription_debug = {
@@ -1153,9 +1228,9 @@ def get_live_ipo_calendar():
                 "Issue Closes": end_date.strftime("%d-%b-%Y") if end_date else "—",
                 "Days to Close": days_to_close,
                 "Price Band": str(price_band) if price_band else "—",
-                "Lot Size": lot_size or "—",
+                "Lot Size": lot_size if lot_size else "Not published by NSE's public feed",
                 "Issue Size": issue_size or "—",
-                "Fresh Issue (%)": fresh_issue_pct,
+                "Fresh Issue (%)": fresh_issue_pct if fresh_issue_pct is not None else "Not published by NSE's public feed",
                 "Sub — Overall (x)": _num(sub_overall),
                 "Sub — QIB (x)": _num(sub_qib),
                 "Sub — NII/HNI (x)": _num(sub_nii),
@@ -1169,6 +1244,7 @@ def get_live_ipo_calendar():
         "ok": True, "error": None, "as_of": as_of,
         "attempted": len(raw_rows), "succeeded": len(processed), "skipped": skipped,
         "subscription_debug": subscription_debug,
+        "detail_debug": detail_debug,
         "calendar_row_sample": raw_rows[0] if raw_rows else None,
     }
     return df, raw_rows, meta
@@ -1212,6 +1288,7 @@ def build_ipo_recommendation(df):
         qib, overall = row.get("Sub — QIB (x)"), row.get("Sub — Overall (x)")
         rii = row.get("Sub — RII (x)")
         fresh_pct = row.get("Fresh Issue (%)")
+        fresh_pct = fresh_pct if isinstance(fresh_pct, (int, float)) else None  # may be a "not published" label string
 
         if qib is not None:
             inputs_used.append("QIB subscription")

@@ -645,18 +645,37 @@ with tab2:
 
         render_skip_report(ipo_meta, label="IPO listings")
 
-        # Lot Size (and possibly Fresh Issue %) showing "—" for every row
-        # means those field names were guessed wrong too -- same class of
-        # issue as the subscription endpoint. Surface the raw calendar row
-        # so the mapping can be fixed from real data, not another guess.
-        lot_size_all_missing = (reco_df["Lot Size"] == "—").all() if "Lot Size" in reco_df.columns else True
-        calendar_sample = ipo_meta.get("calendar_row_sample")
-        if calendar_sample and lot_size_all_missing:
-            with st.expander("🔍 Diagnostic: raw NSE calendar row (Lot Size / Fresh Issue % not populating)"):
-                st.json(calendar_sample)
+        # Lot Size / Fresh Issue % come from a SEPARATE per-symbol detail
+        # endpoint now (confirmed the calendar endpoint's row never has
+        # them at all -- see get_live_ipo_calendar's module note). Surface
+        # that endpoint's raw response if they're still not populating, so
+        # a wrong field-name guess is visible instead of a bare "—".
+        lot_size_unavailable = (
+            reco_df["Lot Size"].astype(str).str.contains("Not published", na=False).all()
+            if "Lot Size" in reco_df.columns else True
+        )
+        detail_debug = ipo_meta.get("detail_debug")
+        if detail_debug and lot_size_unavailable:
+            with st.expander("🔍 Diagnostic: per-symbol IPO detail fetch (Lot Size / Fresh Issue % still unavailable)"):
+                st.write(f"**Symbol tested:** {detail_debug.get('symbol')}")
+                st.write(f"**URL called:** {detail_debug.get('url')}")
+                st.write(f"**HTTP status:** {detail_debug.get('status_code')}")
+                if detail_debug.get("exception"):
+                    st.error(f"Request failed: {detail_debug['exception']}")
+                elif detail_debug.get("raw_json") is not None:
+                    st.json(detail_debug["raw_json"])
+                elif detail_debug.get("raw_text_snippet"):
+                    st.code(detail_debug["raw_text_snippet"], language="text")
+                else:
+                    st.warning(
+                        "This endpoint returned nothing usable. It's possible NSE simply doesn't publish "
+                        "lot size or the fresh-issue split anywhere in a free API — at that point it's not "
+                        "worth chasing further, and the app will keep showing \"Not published by NSE's "
+                        "public feed\" honestly rather than guessing."
+                    )
                 st.caption(
-                    "This is one full, real row from NSE's upcoming-issues response. Share this to get "
-                    "the Lot Size, Issue Size, and Fresh Issue % field-mapping corrected."
+                    "Share this output (or confirm it's empty/404) to either fix the mapping or confirm "
+                    "this data just isn't publicly available."
                 )
 
 
