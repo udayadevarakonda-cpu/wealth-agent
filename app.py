@@ -539,6 +539,27 @@ with tab2:
                     "their API is unofficial and can change without notice. Share this raw shape to "
                     "get the field-mapping corrected."
                 )
+
+        # Subscription (QIB/NII/RII) came back empty for every open issue —
+        # show exactly what NSE's bid-detail endpoint actually returned for
+        # the first attempt, so the field-mapping can be fixed from real
+        # data instead of another guess.
+        sub_debug = ipo_meta.get("subscription_debug")
+        any_open = (reco_df["Status"] == "OPEN").any() if not reco_df.empty else False
+        all_sub_missing = reco_df["Sub — QIB (x)"].isna().all() if "Sub — QIB (x)" in reco_df.columns else True
+        if sub_debug and any_open and all_sub_missing:
+            with st.expander("🔍 Diagnostic: live subscription fetch (all open issues show 'Calendar only')"):
+                st.write(f"**Symbol tested:** {sub_debug.get('symbol')}")
+                st.write(f"**URL called:** {sub_debug.get('url')}")
+                st.write(f"**HTTP status:** {sub_debug.get('status_code')}")
+                if sub_debug.get("exception"):
+                    st.error(f"Request failed: {sub_debug['exception']}")
+                elif sub_debug.get("raw_text"):
+                    st.code(sub_debug["raw_text"], language="json")
+                st.caption(
+                    "This is NSE's actual response for the subscription endpoint this tool guessed at. "
+                    "Share this output to get the field-mapping (or the endpoint itself) corrected."
+                )
 # =============================================================================
 # TAB 3: CORE MUTUAL FUND QUALIFIER
 # =============================================================================

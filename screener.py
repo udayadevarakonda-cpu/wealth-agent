@@ -1007,6 +1007,7 @@ def get_live_ipo_calendar():
 
     today = _dt.date.today()
     processed, skipped = [], []
+    subscription_debug = None  # captures the FIRST live subscription attempt, whatever the outcome
 
     for row in raw_rows:
         try:
@@ -1049,8 +1050,14 @@ def get_live_ipo_calendar():
 
             sub_overall = sub_qib = sub_nii = sub_rii = None
             if symbol and status == "OPEN":
+                capture_this_one = subscription_debug is None  # only capture the first attempt, to keep meta small
                 try:
                     bid_resp = session.get(NSE_IPO_BID_URL, params={"symbol": symbol, "series": "EQ"}, timeout=8)
+                    if capture_this_one:
+                        subscription_debug = {
+                            "symbol": symbol, "url": bid_resp.url, "status_code": bid_resp.status_code,
+                            "raw_text": bid_resp.text[:1500], "exception": None,
+                        }
                     if bid_resp.status_code == 200:
                         bid_json = bid_resp.json()
                         bid_data = bid_json if isinstance(bid_json, dict) else {}
@@ -1074,7 +1081,12 @@ def get_live_ipo_calendar():
                                     sub_rii = cat_sub
                                 elif "TOTAL" in cat_name and sub_overall is None:
                                     sub_overall = cat_sub
-                except Exception:
+                except Exception as e:
+                    if capture_this_one:
+                        subscription_debug = {
+                            "symbol": symbol, "url": NSE_IPO_BID_URL, "status_code": None,
+                            "raw_text": None, "exception": f"{type(e).__name__}: {e}",
+                        }
                     pass  # subscription is best-effort; the calendar row still stands without it
 
             def _num(v):
@@ -1107,6 +1119,7 @@ def get_live_ipo_calendar():
     meta = {
         "ok": True, "error": None, "as_of": as_of,
         "attempted": len(raw_rows), "succeeded": len(processed), "skipped": skipped,
+        "subscription_debug": subscription_debug,
     }
     return df, raw_rows, meta
 
