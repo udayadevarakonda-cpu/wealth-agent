@@ -1,4 +1,5 @@
 import streamlit as st
+import re
 import pandas as pd
 import numpy as np
 import plotly.express as px
@@ -595,6 +596,9 @@ with tab2:
     with st.spinner("Fetching live IPO calendar from NSE..."):
         ipo_df, ipo_raw, ipo_meta = cached_ipo_scan(st.session_state.refresh_counter)
 
+    reco_df = pd.DataFrame()  # always defined, even if the fetch below fails or returns nothing --
+                              # Tab 5's company picker reads this and must never hit a NameError.
+
     if not ipo_meta.get("ok"):
         st.error(
             f"⚠️ **Could not fetch live IPO data from NSE right now** "
@@ -892,35 +896,81 @@ with tab5:
     if "ipo_tracker_entries" not in st.session_state:
         st.session_state.ipo_tracker_entries = []
 
-    with st.form("ipo_tracker_form", clear_on_submit=False):
+    # --- Load from Tab 2's live IPO calendar --------------------------------
+    # Outside the form deliberately: Streamlit only re-applies a widget's
+    # `value=` on first creation, not on every rerun. Keying every field
+    # below to the selected company forces a fresh widget (and fresh
+    # defaults) each time the dropdown changes, which is what makes the
+    # autofill actually work rather than silently doing nothing after the
+    # first selection.
+    company_options = ["— Manual Entry —"]
+    company_lookup = {}
+    if not reco_df.empty:
+        for _, r in reco_df.iterrows():
+            label = f"{r['Company']} ({r['Symbol']})" if r.get("Symbol") not in (None, "—") else r["Company"]
+            company_options.append(label)
+            company_lookup[label] = r
+
+    selected_label = st.selectbox(
+        "🔗 Load from Live IPO Calendar (optional)",
+        options=company_options, key="tracker_company_picker",
+        help="Auto-fills Company Name, Symbol, and Cap Price from Tab 2's live data. "
+             "Peer P/E and BRLM track record still need to come from the RHP yourself — "
+             "NSE's live feed doesn't publish those."
+    )
+
+    prefill = {"company": "", "symbol": "", "cap_price": 0.0}
+    selected_key = "manual"
+    if selected_label != "— Manual Entry —" and selected_label in company_lookup:
+        r = company_lookup[selected_label]
+        selected_key = selected_label
+        prefill["company"] = r["Company"]
+        prefill["symbol"] = r["Symbol"] if r.get("Symbol") not in (None, "—") else ""
+        # Cap Price = the upper number in a "Rs.168 to Rs.177" style string.
+        nums = re.findall(r"[\d,]+\.?\d*", str(r.get("Price Band", "")))
+        if nums:
+            try:
+                prefill["cap_price"] = float(nums[-1].replace(",", ""))
+            except ValueError:
+                prefill["cap_price"] = 0.0
+
+        fresh_pct = r.get("Fresh Issue (%)")
+        fresh_display = f"{fresh_pct}%" if isinstance(fresh_pct, (int, float)) else "Not published"
+        st.info(
+            f"📡 **Loaded from Tab 2:** {r['Company']} — Status: {r.get('Status', '—')} · "
+            f"Days to Close: {r.get('Days to Close', '—')} · Fresh Issue: {fresh_display} · "
+            f"Live Recommendation: {r.get('Recommendation', '—')}"
+        )
+
+    with st.form(f"ipo_tracker_form_{selected_key}", clear_on_submit=False):
         st.markdown("##### ➕ Add / Update an IPO")
         fc1, fc2, fc3 = st.columns(3)
         with fc1:
-            t_company = st.text_input("Company Name", key="t_company")
-            t_symbol = st.text_input("Symbol (optional)", key="t_symbol")
+            t_company = st.text_input("Company Name", value=prefill["company"], key=f"t_company_{selected_key}")
+            t_symbol = st.text_input("Symbol (optional)", value=prefill["symbol"], key=f"t_symbol_{selected_key}")
         with fc2:
-            t_cap_price = st.number_input("Cap Price (₹)", min_value=0.0, value=0.0, step=1.0, key="t_cap_price")
-            t_company_pe = st.number_input("Company P/E at Cap Price", min_value=0.0, value=0.0, step=0.1, key="t_company_pe")
+            t_cap_price = st.number_input("Cap Price (₹)", min_value=0.0, value=prefill["cap_price"], step=1.0, key=f"t_cap_price_{selected_key}")
+            t_company_pe = st.number_input("Company P/E at Cap Price", min_value=0.0, value=0.0, step=0.1, key=f"t_company_pe_{selected_key}")
         with fc3:
-            t_qty = st.number_input("Qty Allotted (optional, fill in once known)", min_value=0, value=0, step=1, key="t_qty")
+            t_qty = st.number_input("Qty Allotted (optional, fill in once known)", min_value=0, value=0, step=1, key=f"t_qty_{selected_key}")
 
-        st.markdown("**Peer Group P/E** (from \"Basis for the Offer Price\")")
+        st.markdown("**Peer Group P/E** (from \"Basis for the Offer Price\") — not available live, enter from the RHP")
         pc1, pc2, pc3 = st.columns(3)
         with pc1:
-            t_peer_low = st.number_input("Peer P/E — Lowest", min_value=0.0, value=0.0, step=0.1, key="t_peer_low")
+            t_peer_low = st.number_input("Peer P/E — Lowest", min_value=0.0, value=0.0, step=0.1, key=f"t_peer_low_{selected_key}")
         with pc2:
-            t_peer_avg = st.number_input("Peer P/E — Average", min_value=0.0, value=0.0, step=0.1, key="t_peer_avg")
+            t_peer_avg = st.number_input("Peer P/E — Average", min_value=0.0, value=0.0, step=0.1, key=f"t_peer_avg_{selected_key}")
         with pc3:
-            t_peer_high = st.number_input("Peer P/E — Highest", min_value=0.0, value=0.0, step=0.1, key="t_peer_high")
+            t_peer_high = st.number_input("Peer P/E — Highest", min_value=0.0, value=0.0, step=0.1, key=f"t_peer_high_{selected_key}")
 
-        st.markdown("**BRLM Track Record** (from \"Risk to Investors\")")
+        st.markdown("**BRLM Track Record** (from \"Risk to Investors\") — not available live, enter from the RHP")
         bc1, bc2, bc3 = st.columns(3)
         with bc1:
-            t_brlm_name = st.text_input("BRLM Name (optional)", key="t_brlm_name")
+            t_brlm_name = st.text_input("BRLM Name (optional)", key=f"t_brlm_name_{selected_key}")
         with bc2:
-            t_brlm_total = st.number_input("Total Issues Handled (past 3 yrs)", min_value=0, value=0, step=1, key="t_brlm_total")
+            t_brlm_total = st.number_input("Total Issues Handled (past 3 yrs)", min_value=0, value=0, step=1, key=f"t_brlm_total_{selected_key}")
         with bc3:
-            t_brlm_closed_below = st.number_input("Of Those, Closed Below Issue Price", min_value=0, value=0, step=1, key="t_brlm_closed_below")
+            t_brlm_closed_below = st.number_input("Of Those, Closed Below Issue Price", min_value=0, value=0, step=1, key=f"t_brlm_closed_below_{selected_key}")
 
         submitted = st.form_submit_button("💾 Save Entry", use_container_width=True)
 
