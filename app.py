@@ -11,7 +11,8 @@ from screener import (
     get_universe_tickers,
     run_scorecard_scan,
     run_historical_backtest,
-    scan_live_ipos,
+    get_live_ipo_calendar,
+    score_ipo_calendar,
     DEFAULT_SCORECARD_WEIGHTS
 )
 
@@ -56,7 +57,7 @@ def cached_stock_scan(tickers, budget, bust):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def cached_ipo_scan(bust):
-    return scan_live_ipos()
+    return get_live_ipo_calendar()
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -355,8 +356,13 @@ with tab2:
             liquidity_floor_inr, max_leverage_multiple, st.session_state.scorecard_bust
         )
 
+    tech_meta = scan_meta.get("technical", {})
+    fund_meta = scan_meta.get("fundamentals", {})
     scorecard_meta = scan_meta.get("scorecard", {})
     sector_caps = scorecard_meta.get("sector_caps", {})
+
+    render_skip_report(tech_meta, label="tickers (technical data)")
+    render_skip_report(fund_meta, label="tickers (fundamentals data)")
 
     # =============================================================================
     # SECTOR STRENGTH RADAR & RELATIVE PERFORMANCE VISUALS
@@ -425,11 +431,28 @@ with tab2:
     st.markdown("---")
 
     st.markdown("#### 🧮 Scorecard Pipeline Metrics")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Evaluated Universe", f"{scorecard_meta.get('total', 0)} stocks")
-    c2.metric("🚫 Vetoed (Illiquidity)", f"{scorecard_meta.get('vetoed_illiquid', 0)}")
-    c3.metric("🚫 Vetoed (Leverage)", f"{scorecard_meta.get('vetoed_leverage', 0)}")
-    c4.metric("✅ Fully Scored & Ranked", f"{scorecard_meta.get('scored', 0)}")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Scanned Universe", f"{scorecard_meta.get('total', 0)} stocks",
+              help="The full technical universe — every ticker that made it through get_technical_signals, whether or not it went on to fundamentals.")
+    c2.metric("⏭️ Not Sent to Fundamentals", f"{scorecard_meta.get('not_prescreened', 0)}",
+              help="Non-bullish (or otherwise not pre-screened) tickers — skipped BEFORE the expensive fundamentals fetch to save network calls, not silently dropped from this count.")
+    c3.metric("🚫 Vetoed (Illiquidity)", f"{scorecard_meta.get('vetoed_illiquid', 0)}")
+    c4.metric("🚫 Vetoed (Leverage)", f"{scorecard_meta.get('vetoed_leverage', 0)}")
+    c5.metric("✅ Fully Scored & Ranked", f"{scorecard_meta.get('scored', 0)}")
+
+    if not scorecard_df.empty:
+        with st.expander("Full scorecard — every scanned stock, scored, vetoed, or pre-filtered out"):
+            score_display_cols = [
+                "Stock", "Composite Score", "Momentum Score", "Quality Score", "Valuation Score",
+                "Liquidity Score", "Data Completeness", "Vetoed", "Veto Reason", "LTP (₹)", "Sector"
+            ]
+            valid_score_cols = [c for c in score_display_cols if c in scorecard_df.columns]
+            st.dataframe(scorecard_df[valid_score_cols], use_container_width=True, hide_index=True)
+            st.caption(
+                "Rows marked \"Not Scored — outside momentum pre-filter\" were never sent to the "
+                "fundamentals fetch because they weren't SuperTrend-bullish — they're kept here "
+                "instead of silently dropped, so this table always reflects the FULL scanned universe."
+            )
 
     st.markdown(f"#### 🎯 Top {top_n_stocks} Ranked Momentum Allocations (Sector Constrained)")
     if not top_n_df.empty:
@@ -444,42 +467,68 @@ with tab2:
     st.markdown("---")
 
     # =============================================================================
-    # TACTICAL IPO LISTING GAINS SCANNER (TAB 2)
+    # LIVE IPO CALENDAR (TAB 2) — real NSE data, nothing hardcoded
     # =============================================================================
     st.markdown("---")
-    st.subheader("🚀 Tactical IPO Conviction Scorecard (0–100 Scale)")
-    
-    st.info(
-        "💡 **Strategy Disclaimer & Guidance:**\n"
-        "• **Score $\ge 75$ (🟢 High Conviction - Good to Go):** High safety margin, deep valuation discount vs peers, and strong institutional demand. Clear to apply 1 Retail Lot on Day 3.\n"
-        "• **Score $55 - 74$ (🟡 Moderate / Momentum):** Strong sentiment or GMP, but fundamental quality is average. Speculative Day 1 flip only.\n"
-        "• **Score $< 55$ (🔴 Low Conviction):** Overvalued, predominantly OFS exit, or illiquid SME issues. Automatic Skip."
-    )
+    st.subheader("🚀 Live IPO Calendar")
 
-    ipo_df = cached_ipo_scan(st.session_state.refresh_counter)
+    with st.spinner("Fetching live IPO calendar from NSE..."):
+        ipo_df, ipo_raw, ipo_meta = cached_ipo_scan(st.session_state.refresh_counter)
 
-    # Metric summary
-    apply_count = len(ipo_df[ipo_df["Verdict"] == "🟢 ALLOCATE"])
-    watch_count = len(ipo_df[ipo_df["Verdict"].isin(["🟡 LOOK FORWARD", "🟡 SPECULATIVE"])])
-    skip_count = len(ipo_df[ipo_df["Verdict"] == "🔴 SKIP"])
+    if not ipo_meta.get("ok"):
+        st.error(
+            f"⚠️ **Could not fetch live IPO data from NSE right now** "
+            f"(`{ipo_meta.get('error', 'unknown error')}`). Nothing is shown below — "
+            f"this tool never falls back to stale or hand-typed data. Try **🔄 Force Full Data Refresh** "
+            f"in the sidebar in a minute."
+        )
+    elif ipo_df.empty:
+        st.info(f"NSE reports no active/upcoming IPOs right now. (Checked {ipo_meta.get('as_of', '—')}.)")
+    else:
+        st.caption(
+            f"🟢 Live as of **{ipo_meta.get('as_of', '—')}**, fetched directly from NSE (cached ~15 min). "
+            f"Dates and status are computed against today's actual date — nothing here is hand-typed."
+        )
+        st.info(
+            "💡 **What's shown vs. what isn't:** Issue dates, price band, lot size, and issue size are "
+            "sourced live from NSE. Subscription (times) is fetched live for OPEN issues, when NSE's "
+            "bid-detail endpoint responds. **Grey Market Premium, peer P/E valuation, and RoCE-based "
+            "quality are intentionally NOT shown** — no reliable free live source exists for them, and "
+            "a guessed number would be worse than none. The Demand Score below only uses live "
+            "subscription data; issues without it show \"—\", not a fabricated score."
+        )
 
-    i1, i2, i3 = st.columns(3)
-    i1.metric("🟢 Good to Go (Apply Today)", f"{apply_count} Issues")
-    i2.metric("🟡 High-Conviction Pipeline", f"{watch_count} Issues")
-    i3.metric("🔴 Vetoed / Excluded", f"{skip_count} Issues")
+        scored_df = score_ipo_calendar(ipo_df)
 
-    # Display Table with Scores and Comparative Multiples
-    disp_cols = [
-        "Company", "Conviction Score", "Segment", "Closing Timeline", "Asking P/E", "Peer P/E",
-        "Fresh Issue", "Subscription", "Est. GMP (%)", "Lot Cost (₹)", "Verdict", "Tactical Action"
-    ]
-    st.dataframe(ipo_df[disp_cols], use_container_width=True, hide_index=True)
+        open_count = int((scored_df["Status"] == "OPEN").sum())
+        upcoming_count = int((scored_df["Status"] == "UPCOMING").sum())
+        closed_count = int((scored_df["Status"] == "CLOSED").sum())
 
-    # Highlight Actionable Today
-    today_actionable = ipo_df[ipo_df["Verdict"] == "🟢 ALLOCATE"]
-    if not today_actionable.empty:
-        for _, row in today_actionable.iterrows():
-            st.success(f"🎯 **EXECUTION ALERT ({row['Company']} — Score: {row['Conviction Score']}/100):** {row['Tactical Action']}. Allotted shares are 100% liquid on listing morning ($T+3$).")
+        i1, i2, i3 = st.columns(3)
+        i1.metric("🟢 Open Now", f"{open_count} Issues")
+        i2.metric("🟡 Upcoming", f"{upcoming_count} Issues")
+        i3.metric("⚪ Closed", f"{closed_count} Issues")
+
+        disp_cols = [
+            "Company", "Symbol", "Segment", "Status", "Issue Opens", "Issue Closes", "Days to Close",
+            "Price Band", "Lot Size", "Issue Size", "Subscription (x)", "Demand Score (0-100)", "Live Signal"
+        ]
+        valid_disp_cols = [c for c in disp_cols if c in scored_df.columns]
+        st.dataframe(scored_df[valid_disp_cols], use_container_width=True, hide_index=True)
+
+        render_skip_report(ipo_meta, label="IPO listings")
+
+        # If NSE's response came back non-empty but nothing actually parsed
+        # (schema drift on their unofficial API), surface the raw payload
+        # instead of silently showing an empty/wrong table.
+        if ipo_raw and scored_df.empty:
+            with st.expander("🔍 Diagnostic: raw NSE response (parser found no usable rows)"):
+                st.json(ipo_raw[:3])
+                st.caption(
+                    "NSE returned data but none of it matched the field names this parser expects — "
+                    "their API is unofficial and can change without notice. Share this raw shape to "
+                    "get the field-mapping corrected."
+                )
 # =============================================================================
 # TAB 3: CORE MUTUAL FUND QUALIFIER
 # =============================================================================

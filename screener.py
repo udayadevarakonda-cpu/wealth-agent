@@ -318,13 +318,44 @@ def _percentile_rank(series, higher_is_better=True):
     return ranks if higher_is_better else (100.0 - ranks)
 
 def compute_scorecard(tech_df, fund_df, weights=None, liquidity_floor_inr=10_000_000.0, max_leverage_multiple=3.0):
-    weights = weights or DEFAULT_SCORECARD_WEIGHTS
-    if tech_df.empty or fund_df.empty:
-        return pd.DataFrame(), {"total": 0, "vetoed_illiquid": 0, "vetoed_leverage": 0, "scored": 0}
+    """
+    Merges technical + fundamentals data into one scorecard.
 
-    df = tech_df.merge(fund_df, on="Stock", how="inner").reset_index(drop=True)
-    if df.empty:
-        return pd.DataFrame(), {"total": 0, "vetoed_illiquid": 0, "vetoed_leverage": 0, "scored": 0}
+    tech_df may legitimately contain MORE tickers than fund_df: callers
+    (see run_scorecard_scan) only send bullish candidates to the expensive
+    extended-fundamentals fetch, to cut network calls. This uses a LEFT
+    merge on tech_df so every technically-scanned ticker survives into the
+    output -- non-screened tickers get an explicit "Not Scored — outside
+    momentum pre-filter" status instead of silently vanishing the way an
+    inner merge would. `total` in the returned meta is always len(tech_df)
+    -- the TRUE scanned universe -- never just however many made it to
+    fundamentals, so the UI can't understate how much was actually looked at.
+    """
+    weights = weights or DEFAULT_SCORECARD_WEIGHTS
+    empty_meta = {"total": 0, "not_prescreened": 0, "vetoed_illiquid": 0, "vetoed_leverage": 0, "scored": 0}
+    if tech_df.empty:
+        return pd.DataFrame(), empty_meta
+
+    fund_has_data = (not fund_df.empty) and ("Stock" in fund_df.columns)
+    if fund_has_data:
+        df = tech_df.merge(fund_df, on="Stock", how="left", indicator="_merge_src").reset_index(drop=True)
+        has_fundamentals = df["_merge_src"] == "both"
+        df = df.drop(columns=["_merge_src"])
+    else:
+        # Nothing came back from the fundamentals fetch at all (e.g. every
+        # candidate errored) -- still return every technical row, just with
+        # no ticker marked as fundamentals-screened.
+        df = tech_df.copy().reset_index(drop=True)
+        has_fundamentals = pd.Series(False, index=df.index)
+
+    # Fundamentals columns may be entirely absent if fund_df was empty --
+    # make sure downstream code always has them to reference.
+    for c in ["Sector", "PE", "Debt/Equity", "Dividend Yield (%)", "P/B (CMP/BV)",
+              "Avg Volume", "Earnings Growth 1Y (%)", "ROIC (%)", "Interest Coverage (x)"]:
+        if c not in df.columns:
+            df[c] = np.nan
+
+    not_prescreened_mask = ~has_fundamentals
 
     def leave_one_out_median(col):
         valid = df[col].notna() & (df[col] > 0)
@@ -340,15 +371,30 @@ def compute_scorecard(tech_df, fund_df, weights=None, liquidity_floor_inr=10_000
 
     illiquid_mask = df["ADTV (₹)"].notna() & (df["ADTV (₹)"] < liquidity_floor_inr)
     extreme_lev_mask = df["D/E Relative"].notna() & (df["D/E Relative"] > max_leverage_multiple)
-    vetoed = illiquid_mask | extreme_lev_mask
+    # Can't veto a stock on fundamentals data that was never fetched --
+    # those rows are already excluded from scoring via not_prescreened_mask.
+    vetoed = (illiquid_mask | extreme_lev_mask) & has_fundamentals
 
     df["Vetoed"] = vetoed
-    df["Veto Reason"] = np.where(illiquid_mask & extreme_lev_mask, "Illiquid + Leverage",
-                        np.where(illiquid_mask, "Illiquid (ADTV below floor)",
-                        np.where(extreme_lev_mask, "Extreme Leverage", "—")))
+    df["Veto Reason"] = np.where(
+        not_prescreened_mask, "Not Scored — outside momentum pre-filter (fundamentals not fetched)",
+        np.where(illiquid_mask & extreme_lev_mask, "Illiquid + Leverage",
+        np.where(illiquid_mask, "Illiquid (ADTV below floor)",
+        np.where(extreme_lev_mask, "Extreme Leverage", "—")))
+    )
 
-    scoreable = df[~vetoed].copy()
-    meta = {"total": len(df), "vetoed_illiquid": int(illiquid_mask.sum()), "vetoed_leverage": int(extreme_lev_mask.sum()), "scored": len(scoreable)}
+    for c in ["Momentum Score", "Quality Score", "Valuation Score", "Liquidity Score", "Composite Score"]:
+        df[c] = np.nan
+    df["Data Completeness"] = "0/11"
+
+    scoreable = df[~vetoed & ~not_prescreened_mask].copy()
+    meta = {
+        "total": len(df),
+        "not_prescreened": int(not_prescreened_mask.sum()),
+        "vetoed_illiquid": int(illiquid_mask.sum()),
+        "vetoed_leverage": int(extreme_lev_mask.sum()),
+        "scored": len(scoreable),
+    }
 
     if scoreable.empty:
         return df.sort_values("Stock").reset_index(drop=True), meta
@@ -849,145 +895,207 @@ def compute_adx_series(df, period=14):
     dx = ((plus_di - minus_di).abs() / denom.replace(0, np.nan)) * 100
     return dx.rolling(period).mean().fillna(0).values
 
-# # =============================================================================
-# 9. PRODUCTION-GRADE IPO CONVICTION & QUALITY SCORECARD (0-100)
+
+
 # =============================================================================
-def scan_live_ipos():
+# 9. LIVE IPO CALENDAR (Real NSE Data — Nothing Hardcoded)
+# =============================================================================
+# The previous version of this feature was a hardcoded Python list of IPO
+# names/dates/subscription/GMP figures typed in once. It LOOKED live (a
+# spinner, "closes today" banners) but the underlying data never changed —
+# once today's date moved past the hand-typed dates, it kept confidently
+# showing stale "APPLY TODAY" alerts. This replaces it with a real fetch
+# against NSE's own IPO data. No date, price, or status shown below is
+# ever hand-typed — they're all derived live from NSE's response and
+# today's actual date.
+#
+# Two inputs from the OLD scorecard are DELIBERATELY left out here rather
+# than faked with a "best guess":
+#   - Grey Market Premium (GMP): not an NSE-published figure at all. The
+#     only sources are unofficial GMP-tracker sites with no stable free
+#     API and uncertain scraping terms — not something to guess at.
+#   - Peer P/E valuation arbitrage & RoCE-based fundamental quality: a
+#     pre-listing company has no yfinance history and no listed-peer
+#     mapping anywhere in this codebase. Building that would mean
+#     hand-typing a peer table — the exact hardcoding problem being fixed.
+# What IS shown is sourced live: issue dates, price band, lot size, issue
+# size, and (when NSE's bid-detail endpoint responds) live subscription.
+# The score below is intentionally small and only uses fields that are
+# actually live-sourced — see score_ipo_calendar().
+#
+# IMPORTANT CAVEAT for whoever runs this next: NSE's api/all-upcoming-issues
+# schema is UNOFFICIAL and this dev environment has no network access to
+# test a live response against it. Field names below are a best-effort
+# guess at the shape NSE's own site consumes, with multiple candidate key
+# names tried per field. If parsing comes up empty, get_live_ipo_calendar()
+# still returns the untouched raw NSE response so the app can show it in a
+# diagnostic panel instead of silently failing — check that first if the
+# table looks wrong, and the field-mapping can be tightened from there.
+NSE_HOME_URL = "https://www.nseindia.com/"
+NSE_IPO_API_URL = "https://www.nseindia.com/api/all-upcoming-issues?category=ipo"
+NSE_IPO_BID_URL = "https://www.nseindia.com/api/ipo-active-category"
+
+_NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "application/json",
+}
+
+
+def _get_nse_session():
     """
-    Computes a 0-100 Institutional IPO Conviction Score (ICS):
-    1. Demand Velocity (20 pts max): Scaled against 50x institutional subscription.
-    2. Sentiment & GMP (15 pts max): Scaled against 100% listing pop expectation.
-    3. Valuation Arbitrage (25 pts max): Deep peer PE discount calibration.
-    4. Issue Structure (20 pts max): Fresh issue growth capital vs promoter OFS.
-    5. Fundamental Quality (20 pts max): Multi-year RoCE and capital efficiency.
+    NSE's www.nseindia.com/api/* endpoints reject cold requests — they
+    require cookies set by first loading a normal page. This two-step
+    handshake (warm up on the homepage, then call the API with the same
+    session) is what every unofficial NSE scraper does; the archives.
+    nseindia.com CSV endpoints this tool already uses for index
+    constituents don't need it, but www.nseindia.com's JSON API does.
     """
-    import datetime
-    now = datetime.datetime.now()
-    today_str = now.strftime("%d-%b").lower()
-    
-    raw_ipos = [
-        {
-            "name": "Lumino Industries", "segment": "Mainboard", "issue_price": 82.0, "lot_size": 182,
-            "closing_date": "31-Aug", "is_closing_today": True, "subscription": 22.29, "gmp_pct": 75.0,
-            "pe_asking": 15.6, "pe_peer_avg": 45.0, "fresh_issue_pct": 71.4, "roce_pct": 21.5, "close_day_int": 0
-        },
-        {
-            "name": "ESDS Software Solution", "segment": "Mainboard", "issue_price": 429.0, "lot_size": 34,
-            "closing_date": "01-Sep", "is_closing_today": False, "subscription": 10.55, "gmp_pct": 86.2,
-            "pe_asking": 28.4, "pe_peer_avg": 52.0, "fresh_issue_pct": 85.0, "roce_pct": 19.8, "close_day_int": 1
-        },
-        {
-            "name": "Priority Jewels", "segment": "Mainboard", "issue_price": 200.0, "lot_size": 75,
-            "closing_date": "01-Sep", "is_closing_today": False, "subscription": 13.19, "gmp_pct": 22.5,
-            "pe_asking": 32.0, "pe_peer_avg": 34.0, "fresh_issue_pct": 50.0, "roce_pct": 14.2, "close_day_int": 1
-        },
-        {
-            "name": "Deepa Jewellers", "segment": "Mainboard", "issue_price": 177.0, "lot_size": 84,
-            "closing_date": "03-Sep", "is_closing_today": False, "subscription": 0.0, "gmp_pct": 26.5,
-            "pe_asking": 26.0, "pe_peer_avg": 34.0, "fresh_issue_pct": 60.0, "roce_pct": 15.0, "close_day_int": 3
-        },
-        {
-            "name": "Kwick Forensic Solutions", "segment": "SME", "issue_price": 90.0, "lot_size": 1600,
-            "closing_date": "31-Aug", "is_closing_today": True, "subscription": 89.00, "gmp_pct": 77.8,
-            "pe_asking": 22.0, "pe_peer_avg": 25.0, "fresh_issue_pct": 100.0, "roce_pct": 24.0, "close_day_int": 0
-        },
-        {
-            "name": "Paluck Technologies", "segment": "SME", "issue_price": 48.0, "lot_size": 3000,
-            "closing_date": "01-Sep", "is_closing_today": False, "subscription": 18.18, "gmp_pct": 52.1,
-            "pe_asking": 18.0, "pe_peer_avg": 20.0, "fresh_issue_pct": 100.0, "roce_pct": 16.5, "close_day_int": 1
-        },
-        {
-            "name": "Complete Sports & Mgmt", "segment": "SME", "issue_price": 135.0, "lot_size": 1000,
-            "closing_date": "01-Sep", "is_closing_today": False, "subscription": 0.17, "gmp_pct": 0.0,
-            "pe_asking": 45.0, "pe_peer_avg": 25.0, "fresh_issue_pct": 30.0, "roce_pct": 8.0, "close_day_int": 1
-        },
-        {
-            "name": "Rays of Belief", "segment": "Mainboard", "issue_price": 239.0, "lot_size": 62,
-            "closing_date": "03-Sep", "is_closing_today": False, "subscription": 0.0, "gmp_pct": 12.1,
-            "pe_asking": 48.0, "pe_peer_avg": 40.0, "fresh_issue_pct": 40.0, "roce_pct": 11.0, "close_day_int": 3
-        }
-    ]
+    session = requests.Session()
+    session.headers.update(_NSE_HEADERS)
+    session.get(NSE_HOME_URL, timeout=10)
+    return session
 
-    processed = []
-    for item in raw_ipos:
-        lot_cost = round(item["issue_price"] * item["lot_size"], 2)
-        days_left = item.get("close_day_int", 0)
 
-        # Dynamic Timeline Tag
-        if item["is_closing_today"] or days_left == 0:
-            countdown_tag = "⚡ Closes Today"
-        elif days_left == 1:
-            countdown_tag = "⏳ Closes in 1 Day"
-        elif days_left > 1:
-            countdown_tag = f"⏳ Closes in {days_left} Days"
-        else:
-            countdown_tag = "🏁 Closed"
+def _pick(row, *keys, default=None):
+    """Try several candidate field names — NSE's exact schema is unverified."""
+    for k in keys:
+        if isinstance(row, dict) and row.get(k) not in (None, ""):
+            return row[k]
+    return default
 
-        # --- INSTITUTIONAL SCORING RUBRIC (0-100) ---
-        if item["segment"] == "SME":
-            total_score = 35.0  # Automatic Veto Cap
-            verdict = "🔴 SKIP"
-            action = "AVOID — High ticket size (₹1.2L+) & post-listing illiquidity"
-        else:
-            # 1. Demand Velocity (20 pts max — Scaled to 50x)
-            sub_val = item.get("subscription", 0.0)
-            score_demand = min(20.0, (sub_val / 50.0) * 20.0) if sub_val > 0 else 3.0
 
-            # 2. Sentiment & GMP (15 pts max — Scaled to 100% GMP)
-            gmp_val = item.get("gmp_pct", 0.0)
-            score_gmp = min(15.0, (gmp_val / 100.0) * 15.0)
+def _parse_nse_date(val):
+    if not val:
+        return None
+    import datetime as _dt
+    for fmt in ("%d-%b-%Y", "%d-%b-%y", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return _dt.datetime.strptime(str(val).strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
 
-            # 3. Valuation Arbitrage vs Peers (25 pts max)
-            pe_ask, pe_peer = item.get("pe_asking", 30.0), item.get("pe_peer_avg", 30.0)
-            val_discount = (pe_peer - pe_ask) / pe_peer if pe_peer > 0 else 0
-            if val_discount >= 0.50: score_val = 25.0
-            elif val_discount >= 0.25: score_val = 20.0
-            elif val_discount >= 0.0: score_val = 14.0
-            else: score_val = 5.0
 
-            # 4. Issue Structure (20 pts max)
-            fresh_pct = item.get("fresh_issue_pct", 50.0)
-            if fresh_pct >= 70.0: score_struct = 20.0
-            elif fresh_pct >= 50.0: score_struct = 14.0
-            else: score_struct = 6.0
+def get_live_ipo_calendar():
+    """
+    Fetches the ACTUAL current IPO calendar from NSE — no hardcoded
+    issues, no hand-typed dates. Returns (issues_df, raw_rows, meta):
+      - raw_rows is the untouched NSE API response, kept so the caller can
+        show it in a diagnostic panel if the parsed table comes up empty
+        (i.e. NSE's field names don't match what's guessed here).
+      - meta always reports what actually happened (ok/error/as_of/skip
+        report) — a failed fetch returns an EMPTY result with a reason,
+        NEVER a fallback to stale hardcoded data. A silent fallback here
+        would just recreate the "looks live, isn't" problem being fixed.
+    """
+    import datetime as _dt
+    try:
+        session = _get_nse_session()
+        resp = session.get(NSE_IPO_API_URL, timeout=12)
+        if resp.status_code != 200:
+            return pd.DataFrame(), [], {"ok": False, "error": f"NSE IPO API returned HTTP {resp.status_code}", "as_of": None}
+        payload = resp.json()
+    except Exception as e:
+        return pd.DataFrame(), [], {"ok": False, "error": f"{type(e).__name__}: {e}", "as_of": None}
 
-            # 5. Fundamental Quality / RoCE (20 pts max)
-            roce = item.get("roce_pct", 12.0)
-            if roce >= 20.0: score_fund = 20.0
-            elif roce >= 15.0: score_fund = 15.0
-            else: score_fund = 8.0
+    raw_rows = payload if isinstance(payload, list) else payload.get("data", payload.get("all_upcoming", []))
+    as_of = _dt.datetime.now().strftime("%d-%b-%Y %H:%M")
+    if not raw_rows:
+        return pd.DataFrame(), [], {"ok": True, "error": None, "as_of": as_of, "attempted": 0, "succeeded": 0, "skipped": []}
 
-            total_score = round(score_demand + score_gmp + score_val + score_struct + score_fund, 1)
+    today = _dt.date.today()
+    processed, skipped = [], []
 
-            # Verdict Assignment
-            if total_score >= 75.0 and (item["is_closing_today"] or days_left == 0):
-                verdict = "🟢 ALLOCATE"
-                action = f"HIGH CONVICTION — Apply 1 Lot (₹{lot_cost:,.0f}) before 4:30 PM"
-            elif total_score >= 75.0:
-                verdict = "🟡 LOOK FORWARD"
-                action = f"TOP PIPELINE — Prepare 1 Lot (₹{lot_cost:,.0f}) for Day 3 Close"
-            elif total_score >= 55.0:
-                verdict = "🟡 SPECULATIVE"
-                action = f"MOMENTUM PLAY — Wait for Day 3 QIB data"
+    for row in raw_rows:
+        try:
+            company = _pick(row, "companyName", "company", "symbol")
+            symbol = _pick(row, "symbol", "companySymbol")
+            if not company:
+                skipped.append((str(row)[:60], "No recognizable company-name field — NSE schema may have changed"))
+                continue
+
+            series = _pick(row, "series", "seriesName", default="")
+            segment = "SME" if ("SME" in str(series).upper() or "SME" in str(company).upper()) else "Mainboard"
+
+            start_date = _parse_nse_date(_pick(row, "issueStartDate", "startDate", "biddingStartDate"))
+            end_date = _parse_nse_date(_pick(row, "issueEndDate", "endDate", "biddingEndDate"))
+
+            if end_date:
+                if start_date and today < start_date:
+                    status = "UPCOMING"
+                elif today <= end_date:
+                    status = "OPEN"
+                else:
+                    status = "CLOSED"
             else:
-                verdict = "🔴 SKIP"
-                action = "SKIP — Low conviction score / rich valuation"
+                status = "UNKNOWN"
 
-        processed.append({
-            "Company": item["name"],
-            "Segment": item["segment"],
-            "Conviction Score": total_score,
-            "Closing Timeline": countdown_tag,
-            "Closing Date": item["closing_date"],
-            "Asking P/E": f"{item.get('pe_asking', '—')}x",
-            "Peer P/E": f"{item.get('pe_peer_avg', '—')}x",
-            "Fresh Issue": f"{item.get('fresh_issue_pct', '—')}%",
-            "Subscription": f"{item['subscription']}x" if item['subscription'] > 0 else "—",
-            "Est. GMP (%)": f"+{item['gmp_pct']}%" if item['gmp_pct'] > 0 else "0%",
-            "Lot Cost (₹)": lot_cost,
-            "Verdict": verdict,
-            "Tactical Action": action
-        })
+            days_to_close = (end_date - today).days if (end_date and status == "OPEN") else None
+
+            price_band = _pick(row, "issuePrice", "priceBand", "price")
+            lot_size = _pick(row, "lotSize", "marketLot")
+            issue_size = _pick(row, "issueSize", "totalIssueSize")
+
+            sub_times = None
+            if symbol and status == "OPEN":
+                try:
+                    bid_resp = session.get(NSE_IPO_BID_URL, params={"symbol": symbol, "series": "EQ"}, timeout=8)
+                    if bid_resp.status_code == 200:
+                        bid_json = bid_resp.json()
+                        sub_times = _pick(bid_json if isinstance(bid_json, dict) else {},
+                                           "totalSubscription", "overallSubscription")
+                except Exception:
+                    pass  # subscription is best-effort; the calendar row still stands without it
+
+            processed.append({
+                "Company": company,
+                "Symbol": symbol or "—",
+                "Segment": segment,
+                "Status": status,
+                "Issue Opens": start_date.strftime("%d-%b-%Y") if start_date else "—",
+                "Issue Closes": end_date.strftime("%d-%b-%Y") if end_date else "—",
+                "Days to Close": days_to_close,
+                "Price Band": str(price_band) if price_band else "—",
+                "Lot Size": lot_size or "—",
+                "Issue Size": issue_size or "—",
+                "Subscription (x)": round(float(sub_times), 2) if sub_times not in (None, "") else None,
+            })
+        except Exception as e:
+            skipped.append((str(_pick(row, "companyName", "symbol", default="unknown"))[:40], str(e)))
 
     df = pd.DataFrame(processed)
-    return df.sort_values(by="Conviction Score", ascending=False).reset_index(drop=True)
+    meta = {
+        "ok": True, "error": None, "as_of": as_of,
+        "attempted": len(raw_rows), "succeeded": len(processed), "skipped": skipped,
+    }
+    return df, raw_rows, meta
+
+
+def score_ipo_calendar(df):
+    """
+    A deliberately SMALL, honestly-scoped score — built only from fields
+    that are actually live-sourced in get_live_ipo_calendar(). No GMP, no
+    peer P/E, no RoCE (see the module note above for why). Issues that
+    aren't OPEN yet, or are OPEN but NSE's bid-detail endpoint didn't
+    return a subscription figure, show "—" rather than a fabricated score.
+    """
+    if df.empty:
+        return df
+    df = df.copy()
+
+    def _tag(row):
+        if row["Status"] != "OPEN" or row["Subscription (x)"] is None:
+            return np.nan, "Calendar only — no live demand data yet"
+        sub = row["Subscription (x)"]
+        if sub >= 20:
+            return 80.0, "🟢 Strong live demand"
+        if sub >= 5:
+            return 60.0, "🟡 Moderate live demand"
+        return 30.0, "🔴 Weak live demand so far"
+
+    tags = [_tag(r) for _, r in df.iterrows()]
+    df["Demand Score (0-100)"] = [t[0] for t in tags]
+    df["Live Signal"] = [t[1] for t in tags]
+    return df
