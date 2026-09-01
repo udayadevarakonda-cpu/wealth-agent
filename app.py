@@ -1027,8 +1027,8 @@ with tab5:
         tracker_df = pd.DataFrame(display_rows)
         st.dataframe(tracker_df, use_container_width=True, hide_index=True)
 
-        # Per-company detail: sell-value tiers once Qty Allotted is known.
-        with st.expander("🔎 Per-company detail — implied sell value at each re-rating tier"):
+        # Per-company detail: sell-value tiers + cost-recovery discipline once Qty Allotted is known.
+        with st.expander("🔎 Per-company detail — re-rating tiers & cost-recovery sell plan"):
             for entry in st.session_state.ipo_tracker_entries:
                 valuation = compute_ipo_valuation_tiers(
                     entry["Cap Price (₹)"], entry["Company P/E"],
@@ -1044,8 +1044,16 @@ with tab5:
                     if "position_value" in t:
                         line += f" — position value: ₹{t['position_value']:,.2f}"
                     st.write(line)
+                    if t.get("cost_recovery_sell_qty") is not None:
+                        st.caption(
+                            f"  💡 Sell **{t['cost_recovery_sell_qty']} shares** ({t['cost_recovery_sell_pct']}% of holding) "
+                            f"at this price to recover your full original investment — the remaining "
+                            f"**{t['shares_running_free']} shares** then run with zero capital at risk."
+                        )
+                    elif t.get("cost_recovery_note"):
+                        st.caption(f"  ⚠️ {t['cost_recovery_note']}")
                 if not entry["Qty Allotted"]:
-                    st.caption("Enter Qty Allotted above (once known) to see position value at each tier.")
+                    st.caption("Enter Qty Allotted above (once known) to see position value and the cost-recovery sell plan at each tier.")
 
         st.caption(
             "⚠️ These are re-rating SCENARIOS, not predictions — they answer \"if the market re-prices "

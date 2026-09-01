@@ -1,5 +1,6 @@
 import io
 import re
+import math
 import time
 import requests
 import numpy as np
@@ -1446,6 +1447,17 @@ def compute_ipo_valuation_tiers(cap_price, company_pe, peer_pe_low, peer_pe_avg,
     earnings stay flat and answers "IF the market re-rates this stock to
     peer-low/average/high multiples, what price would that imply," NOT a
     prediction of whether or when a re-rating happens.
+
+    When qty_allotted is given, each tier also gets a COST-RECOVERY
+    breakdown: the exact number of shares that would need to be sold at
+    that tier's implied price to recoup the full original investment
+    (cap_price x qty_allotted) -- after which every remaining share has
+    zero cost basis and is running with no capital at risk. This is a
+    capital-discipline rule, not a prediction: "sell enough to make this
+    trade risk-free, let the rest run." Rounds UP (math.ceil) so the sale
+    always fully covers the investment, never slightly short of it. Below
+    cap_price, no partial sale can recover the investment -- that's
+    flagged explicitly rather than forced into a number that would mislead.
     """
     if not (cap_price and company_pe and company_pe > 0):
         return None
@@ -1461,9 +1473,22 @@ def compute_ipo_valuation_tiers(cap_price, company_pe, peer_pe_low, peer_pe_avg,
     for label, peer_pe in [("Peer Low", peer_pe_low), ("Peer Average", peer_pe_avg), ("Peer High", peer_pe_high)]:
         result = _implied(peer_pe)
         if result:
-            entry = {"implied_price": result[0], "gain_pct": result[1]}
+            price, gain_pct = result
+            entry = {"implied_price": price, "gain_pct": gain_pct}
             if qty_allotted:
-                entry["position_value"] = round(result[0] * qty_allotted, 2)
+                entry["position_value"] = round(price * qty_allotted, 2)
+                investment = cap_price * qty_allotted
+                if price > cap_price:
+                    sell_qty = min(math.ceil(investment / price), qty_allotted)
+                    entry["cost_recovery_sell_qty"] = sell_qty
+                    entry["cost_recovery_sell_pct"] = round((sell_qty / qty_allotted) * 100, 1)
+                    entry["shares_running_free"] = qty_allotted - sell_qty
+                else:
+                    entry["cost_recovery_sell_qty"] = None
+                    entry["cost_recovery_note"] = (
+                        "Below cost basis — no partial sale recovers the full investment here; "
+                        "this is a hold-or-cut-losses decision, not a cost-recovery one."
+                    )
             tiers[label] = entry
 
     pe_vs_peer_avg_pct = round(((company_pe / peer_pe_avg) - 1) * 100, 1) if peer_pe_avg else None
