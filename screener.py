@@ -1207,23 +1207,45 @@ def get_live_ipo_calendar():
 
                         issue_structure_text = _issue_info_value("Issue Size")
                         if issue_structure_text:
-                            m = re.search(r"Offer for Sale of up to\s*([\d,]+)\s*Equity Shares",
-                                           str(issue_structure_text), re.IGNORECASE)
-                            try:
-                                if m and issue_size not in (None, 0, "0", ""):
-                                    ofs_shares = int(m.group(1).replace(",", ""))
-                                    total_shares = float(str(issue_size).replace(",", ""))
-                                    fresh_shares = total_shares - ofs_shares
-                                    if total_shares > 0 and fresh_shares >= 0:
-                                        fresh_issue_pct = round((fresh_shares / total_shares) * 100, 1)
-                                elif "entirely" in str(issue_structure_text).lower() and "fresh issue" in str(issue_structure_text).lower() \
-                                        and "offer for sale" not in str(issue_structure_text).lower():
-                                    fresh_issue_pct = 100.0
-                                elif "entirely" in str(issue_structure_text).lower() and "offer for sale" in str(issue_structure_text).lower() \
-                                        and "fresh issue" not in str(issue_structure_text).lower():
-                                    fresh_issue_pct = 0.0
-                            except (TypeError, ValueError):
-                                fresh_issue_pct = None
+                            text_lower = str(issue_structure_text).lower()
+                            has_fresh = "fresh issue" in text_lower
+                            has_ofs = "offer for sale" in text_lower
+
+                            if has_fresh and not has_ofs:
+                                # No OFS phrase anywhere -- the entire offer
+                                # is fresh capital. Holds regardless of
+                                # whether the fresh amount itself is stated
+                                # in shares or Rupees (confirmed live across
+                                # 4 different real IPOs using both
+                                # phrasings), so this doesn't need the
+                                # amount at all -- which matters because the
+                                # calendar endpoint's numeric "issueSize" has
+                                # been observed to DISAGREE with the fresh
+                                # share count stated here for some issues (a
+                                # real inconsistency between NSE's two
+                                # endpoints) -- presence/absence sidesteps
+                                # that inconsistency entirely instead of
+                                # risking a nonsense percentage from it.
+                                fresh_issue_pct = 100.0
+                            elif has_ofs and not has_fresh:
+                                fresh_issue_pct = 0.0
+                            elif has_fresh and has_ofs:
+                                m = re.search(r"Offer for Sale of up to\s*([\d,]+)\s*Equity Shares",
+                                               str(issue_structure_text), re.IGNORECASE)
+                                try:
+                                    if m and issue_size not in (None, 0, "0", ""):
+                                        ofs_shares = int(m.group(1).replace(",", ""))
+                                        total_shares = float(str(issue_size).replace(",", ""))
+                                        fresh_shares = total_shares - ofs_shares
+                                        if total_shares > 0 and fresh_shares >= 0:
+                                            fresh_issue_pct = round((fresh_shares / total_shares) * 100, 1)
+                                        # else: OFS share count doesn't fit within
+                                        # the stated total (the same endpoint-
+                                        # disagreement noted above) -- leave
+                                        # unavailable rather than show a
+                                        # nonsensical percentage.
+                                except (TypeError, ValueError):
+                                    fresh_issue_pct = None
 
                         if issue_structure_text:
                             fresh_issue_text_samples.append({
