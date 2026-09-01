@@ -12,7 +12,7 @@ from screener import (
     run_scorecard_scan,
     run_historical_backtest,
     get_live_ipo_calendar,
-    score_ipo_calendar,
+    build_ipo_recommendation,
     DEFAULT_SCORECARD_WEIGHTS
 )
 
@@ -490,19 +490,21 @@ with tab2:
             f"Dates and status are computed against today's actual date — nothing here is hand-typed."
         )
         st.info(
-            "💡 **What's shown vs. what isn't:** Issue dates, price band, lot size, and issue size are "
-            "sourced live from NSE. Subscription (times) is fetched live for OPEN issues, when NSE's "
-            "bid-detail endpoint responds. **Grey Market Premium, peer P/E valuation, and RoCE-based "
-            "quality are intentionally NOT shown** — no reliable free live source exists for them, and "
-            "a guessed number would be worse than none. The Demand Score below only uses live "
-            "subscription data; issues without it show \"—\", not a fabricated score."
+            "💡 **What's shown vs. what isn't:** Issue dates, price band, lot size, issue size, and "
+            "Fresh Issue % are sourced live from NSE. Subscription — Overall, QIB, NII/HNI, RII — is "
+            "fetched live for OPEN issues when NSE's bid-detail endpoint responds. **Grey Market "
+            "Premium and peer-P/E valuation are intentionally NOT shown** — no reliable free live "
+            "source exists for them, and a guessed number would be worse than none. The Recommendation "
+            "column is a rule built only from the live fields above (QIB subscription is weighted "
+            "highest — institutions do real diligence, unlike retail) — it's a rule to weigh, not a "
+            "guarantee, and it's transparent about exactly which live inputs it had for each issue."
         )
 
-        scored_df = score_ipo_calendar(ipo_df)
+        reco_df = build_ipo_recommendation(ipo_df)
 
-        open_count = int((scored_df["Status"] == "OPEN").sum())
-        upcoming_count = int((scored_df["Status"] == "UPCOMING").sum())
-        closed_count = int((scored_df["Status"] == "CLOSED").sum())
+        open_count = int((reco_df["Status"] == "OPEN").sum())
+        upcoming_count = int((reco_df["Status"] == "UPCOMING").sum())
+        closed_count = int((reco_df["Status"] == "CLOSED").sum())
 
         i1, i2, i3 = st.columns(3)
         i1.metric("🟢 Open Now", f"{open_count} Issues")
@@ -511,17 +513,25 @@ with tab2:
 
         disp_cols = [
             "Company", "Symbol", "Segment", "Status", "Issue Opens", "Issue Closes", "Days to Close",
-            "Price Band", "Lot Size", "Issue Size", "Subscription (x)", "Demand Score (0-100)", "Live Signal"
+            "Price Band", "Lot Size", "Issue Size", "Fresh Issue (%)",
+            "Sub — Overall (x)", "Sub — QIB (x)", "Sub — NII/HNI (x)", "Sub — RII (x)",
+            "Recommendation", "Live Data Completeness"
         ]
-        valid_disp_cols = [c for c in disp_cols if c in scored_df.columns]
-        st.dataframe(scored_df[valid_disp_cols], use_container_width=True, hide_index=True)
+        valid_disp_cols = [c for c in disp_cols if c in reco_df.columns]
+        st.dataframe(reco_df[valid_disp_cols], use_container_width=True, hide_index=True)
+
+        open_with_reco = reco_df[reco_df["Status"] == "OPEN"]
+        if not open_with_reco.empty:
+            with st.expander("📋 Recommendation reasoning — one line per open issue"):
+                for _, row in open_with_reco.iterrows():
+                    st.markdown(f"**{row['Company']}** — {row['Recommendation']}  \n{row['Recommendation Note']}")
 
         render_skip_report(ipo_meta, label="IPO listings")
 
         # If NSE's response came back non-empty but nothing actually parsed
         # (schema drift on their unofficial API), surface the raw payload
         # instead of silently showing an empty/wrong table.
-        if ipo_raw and scored_df.empty:
+        if ipo_raw and reco_df.empty:
             with st.expander("🔍 Diagnostic: raw NSE response (parser found no usable rows)"):
                 st.json(ipo_raw[:3])
                 st.caption(

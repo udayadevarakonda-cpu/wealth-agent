@@ -921,7 +921,7 @@ def compute_adx_series(df, period=14):
 # What IS shown is sourced live: issue dates, price band, lot size, issue
 # size, and (when NSE's bid-detail endpoint responds) live subscription.
 # The score below is intentionally small and only uses fields that are
-# actually live-sourced — see score_ipo_calendar().
+# actually live-sourced — see build_ipo_recommendation().
 #
 # IMPORTANT CAVEAT for whoever runs this next: NSE's api/all-upcoming-issues
 # schema is UNOFFICIAL and this dev environment has no network access to
@@ -1037,17 +1037,51 @@ def get_live_ipo_calendar():
             price_band = _pick(row, "issuePrice", "priceBand", "price")
             lot_size = _pick(row, "lotSize", "marketLot")
             issue_size = _pick(row, "issueSize", "totalIssueSize")
+            fresh_issue_pct = _pick(row, "freshIssuePercent", "freshIssuePct")
+            if fresh_issue_pct is None:
+                fresh_amt = _pick(row, "freshIssueSize", "freshIssueAmount")
+                total_amt = _pick(row, "issueSize", "totalIssueSize")
+                try:
+                    if fresh_amt is not None and total_amt not in (None, 0, "0"):
+                        fresh_issue_pct = round((float(fresh_amt) / float(total_amt)) * 100, 1)
+                except (TypeError, ValueError, ZeroDivisionError):
+                    fresh_issue_pct = None
 
-            sub_times = None
+            sub_overall = sub_qib = sub_nii = sub_rii = None
             if symbol and status == "OPEN":
                 try:
                     bid_resp = session.get(NSE_IPO_BID_URL, params={"symbol": symbol, "series": "EQ"}, timeout=8)
                     if bid_resp.status_code == 200:
                         bid_json = bid_resp.json()
-                        sub_times = _pick(bid_json if isinstance(bid_json, dict) else {},
-                                           "totalSubscription", "overallSubscription")
+                        bid_data = bid_json if isinstance(bid_json, dict) else {}
+                        # NSE's category breakdown may come as flat keys or a
+                        # nested list of {category, subscription} rows --
+                        # tried both shapes since the exact structure is
+                        # unverified from this dev environment.
+                        sub_overall = _pick(bid_data, "totalSubscription", "overallSubscription")
+                        sub_qib = _pick(bid_data, "qib", "QIB", "qibSubscription")
+                        sub_nii = _pick(bid_data, "nii", "NII", "hni", "niiSubscription")
+                        sub_rii = _pick(bid_data, "rii", "RII", "retail", "riiSubscription")
+                        if sub_qib is None and isinstance(bid_data.get("data"), list):
+                            for cat_row in bid_data["data"]:
+                                cat_name = str(_pick(cat_row, "category", "categoryName", default="")).upper()
+                                cat_sub = _pick(cat_row, "subscription", "noOfTimesSubscribed", "subTimes")
+                                if "QIB" in cat_name and sub_qib is None:
+                                    sub_qib = cat_sub
+                                elif ("NII" in cat_name or "HNI" in cat_name) and sub_nii is None:
+                                    sub_nii = cat_sub
+                                elif ("RII" in cat_name or "RETAIL" in cat_name) and sub_rii is None:
+                                    sub_rii = cat_sub
+                                elif "TOTAL" in cat_name and sub_overall is None:
+                                    sub_overall = cat_sub
                 except Exception:
                     pass  # subscription is best-effort; the calendar row still stands without it
+
+            def _num(v):
+                try:
+                    return round(float(v), 2) if v not in (None, "") else None
+                except (TypeError, ValueError):
+                    return None
 
             processed.append({
                 "Company": company,
@@ -1060,7 +1094,11 @@ def get_live_ipo_calendar():
                 "Price Band": str(price_band) if price_band else "—",
                 "Lot Size": lot_size or "—",
                 "Issue Size": issue_size or "—",
-                "Subscription (x)": round(float(sub_times), 2) if sub_times not in (None, "") else None,
+                "Fresh Issue (%)": fresh_issue_pct,
+                "Sub — Overall (x)": _num(sub_overall),
+                "Sub — QIB (x)": _num(sub_qib),
+                "Sub — NII/HNI (x)": _num(sub_nii),
+                "Sub — RII (x)": _num(sub_rii),
             })
         except Exception as e:
             skipped.append((str(_pick(row, "companyName", "symbol", default="unknown"))[:40], str(e)))
@@ -1073,29 +1111,82 @@ def get_live_ipo_calendar():
     return df, raw_rows, meta
 
 
-def score_ipo_calendar(df):
+def build_ipo_recommendation(df):
     """
-    A deliberately SMALL, honestly-scoped score — built only from fields
-    that are actually live-sourced in get_live_ipo_calendar(). No GMP, no
-    peer P/E, no RoCE (see the module note above for why). Issues that
-    aren't OPEN yet, or are OPEN but NSE's bid-detail endpoint didn't
-    return a subscription figure, show "—" rather than a fabricated score.
+    A rule-based Apply/Watch/Avoid read, built ONLY from parameters that
+    are actually live-sourced in get_live_ipo_calendar() -- subscription
+    by category (Overall / QIB / NII / RII) and Fresh Issue %. No GMP, no
+    peer P/E, no RoCE: see the module note above for why those stay out
+    rather than being estimated.
+
+    Why these specific parameters: QIB (institutional) subscription is
+    the single most literature-backed FREE, LIVE signal of post-listing
+    performance -- institutions do real diligence before bidding, unlike
+    retail. A wide gap between strong retail demand and weak QIB demand
+    is a well-documented caution pattern (retail-driven hype without
+    institutional confirmation), not something invented for this tool.
+    Fresh Issue % matters because money raised via fresh shares funds the
+    company's growth, while a high Offer-For-Sale share mostly cashes out
+    existing promoters/investors -- a standard, non-fabricated heuristic.
+
+    This is a RULE, not a guarantee -- it reads exactly like the
+    recommendation/recommendation_note pattern already used for stocks
+    and funds elsewhere in this file: what the tool's rule says, and
+    why, so you can weigh it rather than follow it blindly. Rows that
+    aren't OPEN yet, or are OPEN but NSE never returned a usable
+    subscription figure, are marked "Calendar only" -- never scored on
+    guessed numbers.
     """
     if df.empty:
         return df
     df = df.copy()
 
-    def _tag(row):
-        if row["Status"] != "OPEN" or row["Subscription (x)"] is None:
-            return np.nan, "Calendar only — no live demand data yet"
-        sub = row["Subscription (x)"]
-        if sub >= 20:
-            return 80.0, "🟢 Strong live demand"
-        if sub >= 5:
-            return 60.0, "🟡 Moderate live demand"
-        return 30.0, "🔴 Weak live demand so far"
+    def _reco(row):
+        inputs_used = []
+        if row["Status"] != "OPEN":
+            return "⚪ CALENDAR ONLY", "Bidding hasn't opened yet — no live demand data to assess.", "0/2"
 
-    tags = [_tag(r) for _, r in df.iterrows()]
-    df["Demand Score (0-100)"] = [t[0] for t in tags]
-    df["Live Signal"] = [t[1] for t in tags]
+        qib, overall = row.get("Sub — QIB (x)"), row.get("Sub — Overall (x)")
+        rii = row.get("Sub — RII (x)")
+        fresh_pct = row.get("Fresh Issue (%)")
+
+        if qib is not None:
+            inputs_used.append("QIB subscription")
+        if fresh_pct is not None:
+            inputs_used.append("Fresh Issue %")
+        completeness = f"{len(inputs_used)}/2 live inputs"
+
+        if qib is None and overall is None:
+            return "⚪ CALENDAR ONLY", "Issue is open, but NSE hasn't returned a subscription figure yet — check back closer to close.", completeness
+
+        if qib is not None:
+            if qib >= 10:
+                label, note = "🟢 STRONG — Institutional-Backed Demand", f"QIB subscribed {qib}x — real institutional diligence is backing this issue, historically the strongest free live signal available."
+            elif qib >= 3:
+                label, note = "🟡 MODERATE — Some Institutional Interest", f"QIB subscribed {qib}x — decent but not standout institutional demand."
+            elif rii is not None and rii >= 5 and qib < 1:
+                label, note = "🟠 CAUTION — Retail-Driven, Weak Institutional Backing", f"Retail is {rii}x subscribed but QIB is only {qib}x — a known divergence pattern where retail enthusiasm isn't confirmed by institutional diligence."
+            else:
+                label, note = "🔴 WEAK — Limited Institutional Interest", f"QIB subscribed only {qib}x so far."
+        else:
+            # QIB unavailable — fall back to overall subscription, flagged as lower-confidence
+            if overall >= 10:
+                label, note = "🟡 MODERATE — Strong Overall Demand", f"Overall {overall}x subscribed, but institutional (QIB) breakdown wasn't available — this reading is lower-confidence without it."
+            elif overall >= 2:
+                label, note = "🟡 WATCH — Building Demand", f"Overall {overall}x subscribed so far, institutional breakdown unavailable."
+            else:
+                label, note = "🔴 WEAK — Limited Demand So Far", f"Overall subscription only {overall}x."
+
+        if fresh_pct is not None:
+            if fresh_pct < 30:
+                note += f" Fresh issue is only {fresh_pct}% of the raise — most proceeds are an existing-investor exit (OFS), not growth capital."
+            else:
+                note += f" Fresh issue is {fresh_pct}% of the raise, funding the company itself rather than mostly an OFS exit."
+
+        return label, note, completeness
+
+    tags = [_reco(r) for _, r in df.iterrows()]
+    df["Recommendation"] = [t[0] for t in tags]
+    df["Recommendation Note"] = [t[1] for t in tags]
+    df["Live Data Completeness"] = [t[2] for t in tags]
     return df
