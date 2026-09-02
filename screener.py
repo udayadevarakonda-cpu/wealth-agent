@@ -993,6 +993,14 @@ def get_live_ipo_calendar():
         would just recreate the "looks live, isn't" problem being fixed.
     """
     import datetime as _dt
+    # NSE's own dates are quoted in IST, and this app's server (Streamlit
+    # Cloud) runs in UTC -- using the server's local clock for "today"
+    # means anything checked between 12:00 AM and 5:30 AM IST would see
+    # the WRONG calendar day (UTC hasn't rolled over to the new date yet),
+    # incorrectly showing an issue that already closed as still OPEN.
+    # Making IST explicit removes that ambiguity entirely.
+    IST = _dt.timezone(_dt.timedelta(hours=5, minutes=30))
+
     try:
         session = _get_nse_session()
         resp = session.get(NSE_IPO_API_URL, timeout=12)
@@ -1003,11 +1011,11 @@ def get_live_ipo_calendar():
         return pd.DataFrame(), [], {"ok": False, "error": f"{type(e).__name__}: {e}", "as_of": None}
 
     raw_rows = payload if isinstance(payload, list) else payload.get("data", payload.get("all_upcoming", []))
-    as_of = _dt.datetime.now().strftime("%d-%b-%Y %H:%M")
+    as_of = _dt.datetime.now(IST).strftime("%d-%b-%Y %H:%M IST")
     if not raw_rows:
         return pd.DataFrame(), [], {"ok": True, "error": None, "as_of": as_of, "attempted": 0, "succeeded": 0, "skipped": []}
 
-    today = _dt.date.today()
+    today = _dt.datetime.now(IST).date()
     processed, skipped = [], []
     detail_debug = None  # captures the FIRST live per-symbol ipo-detail attempt (subscription + lot size + fresh issue)
     fresh_issue_text_samples = []  # (symbol, raw "Issue Size" text, parsed %) for EVERY open issue -- cheap, already in memory
