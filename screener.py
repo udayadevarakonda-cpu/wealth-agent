@@ -516,20 +516,28 @@ def run_scorecard_scan(tickers, satellite_budget=27000.0, top_n=15, weights=None
 
     scored_candidates = scorecard_df[scorecard_df["Composite Score"].notna()].copy()
 
-    # Apply sector concentration limits
+    # Apply sector concentration limits -- scale each sector's slot
+    # allowance directly from its ACTUAL dynamic cap (10%/20%/30% from
+    # compute_dynamic_sector_caps), instead of a flat yes/no check.
+    # Previously Leading (30%) and Neutral (20%) both mapped to the exact
+    # same slot count (`sector_caps.get(sec) >= 0.20` was true for both),
+    # so a sector turning green in the Tab 2 chart never actually got more
+    # room in the portfolio than a Neutral sector -- only Lagging sectors
+    # were ever restricted. This makes the displayed cap and the actual
+    # allocation agree: Leading sectors genuinely get ~30% of the Top N
+    # slots, Neutral ~20%, Lagging ~10%.
     selected_rows = []
     sector_counts = {}
-    max_per_sector = max(2, int(top_n * 0.30))
 
     for _, row in scored_candidates.iterrows():
         sec = row.get("Sector", "Unknown")
         count = sector_counts.get(sec, 0)
-        
-        allowed_count = max_per_sector if sector_caps.get(sec, 0.20) >= 0.20 else max(1, int(top_n * 0.10))
+
+        allowed_count = max(1, int(round(top_n * sector_caps.get(sec, 0.20))))
         if count < allowed_count:
             selected_rows.append(row)
             sector_counts[sec] = count + 1
-        
+
         if len(selected_rows) >= top_n:
             break
 
