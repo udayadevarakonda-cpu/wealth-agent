@@ -455,42 +455,110 @@ SECTOR_BENCHMARKS = {
     "Consumer Cyclical": "^CNXCONSUM"
 }
 
-def compute_dynamic_sector_caps():
+# One verified, liquid, single-sector NSE ETF per sector above -- confirmed
+# real tickers (not guessed), matching the exact same 8 sectors the radar
+# chart already tracks. Used by scan_sector_etfs() below.
+SECTOR_ETF_MAP = {
+    "Financial Services": "BANKBEES.NS",
+    "Technology": "ITBEES.NS",
+    "Automobile": "AUTOBEES.NS",
+    "Healthcare": "PHARMABEES.NS",
+    "Basic Materials": "METALIETF.NS",
+    "Energy": "MOENERGY.NS",
+    "Industrials": "INFRABEES.NS",
+    "Consumer Cyclical": "CONSUMBEES.NS",
+}
+
+
+def compute_sector_relative_strength():
     """
-    Computes dynamic allocation caps (max % of tactical budget) per sector
-    by measuring 3-month relative performance against Nifty 50.
+    Computes each sector's 3-month return relative to Nifty 50, in
+    percentage points. This is the shared raw calculation behind BOTH the
+    Tab 2 dynamic allocation caps (compute_dynamic_sector_caps buckets
+    these into 10/20/30%) and the sector-ETF momentum ranking
+    (scan_sector_etfs) -- kept as one function so both consumers see
+    identical numbers computed the same way, and so the ETF module never
+    needs a second, redundant fetch of the same sector benchmark data.
+
+    Returns (rel_strength_dict, calc_ok) -- calc_ok is False if the Nifty
+    fetch itself failed or had insufficient history, in which case every
+    sector defaults to 0.0 (i.e. bucketed as Neutral downstream) rather
+    than a fabricated non-zero reading.
     """
-    caps = {}
+    rel_strength = {}
     try:
         nifty = yf.download("^NSEI", period="6m", interval="1d", progress=False)["Close"].squeeze()
         if len(nifty) < 63:
-            return {s: 0.20 for s in SECTOR_BENCHMARKS.keys()}
-            
+            return {s: 0.0 for s in SECTOR_BENCHMARKS.keys()}, False
+
         nifty_ret = (nifty.iloc[-1] / nifty.iloc[-63]) - 1.0
 
         for sector_name, sym in SECTOR_BENCHMARKS.items():
             try:
                 sec_data = yf.download(sym, period="6m", interval="1d", progress=False)["Close"].squeeze()
                 if sec_data.empty or len(sec_data) < 63:
-                    caps[sector_name] = 0.20
+                    rel_strength[sector_name] = 0.0
                     continue
-                
+
                 sec_ret = (sec_data.iloc[-1] / sec_data.iloc[-63]) - 1.0
-                rel_strength = (sec_ret - nifty_ret) * 100.0
-
-                if rel_strength >= 3.0:
-                    caps[sector_name] = 0.30   # Outperforming sector: 30% cap
-                elif rel_strength >= -2.0:
-                    caps[sector_name] = 0.20   # Neutral sector: 20% cap
-                else:
-                    caps[sector_name] = 0.10   # Lagging sector: 10% cap
+                rel_strength[sector_name] = round((sec_ret - nifty_ret) * 100.0, 2)
             except Exception:
-                caps[sector_name] = 0.20
+                rel_strength[sector_name] = 0.0
+        return rel_strength, True
     except Exception:
-        for s in SECTOR_BENCHMARKS.keys():
-            caps[s] = 0.20
+        return {s: 0.0 for s in SECTOR_BENCHMARKS.keys()}, False
 
-    return caps
+
+def compute_dynamic_sector_caps():
+    """
+    Computes dynamic allocation caps (max % of tactical budget) per sector
+    by bucketing compute_sector_relative_strength()'s raw numbers.
+    """
+    rel_strength, calc_ok = compute_sector_relative_strength()
+    caps = {}
+    for sector_name, rs in rel_strength.items():
+        if rs >= 3.0:
+            caps[sector_name] = 0.30   # Outperforming sector: 30% cap
+        elif rs >= -2.0:
+            caps[sector_name] = 0.20   # Neutral sector: 20% cap
+        else:
+            caps[sector_name] = 0.10   # Lagging sector: 10% cap
+    return caps, rel_strength, calc_ok
+
+
+def scan_sector_etfs(sector_rel_strength, top_n=4):
+    """
+    Applies the SAME Dual-Gate momentum test used for stocks (weekly
+    SuperTrend + ADX + 200-day EMA, via get_technical_signals) to the
+    single-sector ETF of whichever sectors are CURRENTLY showing the
+    strongest 3-month relative strength -- not a fixed shortlist. Takes
+    sector_rel_strength as a parameter (already computed by whoever calls
+    compute_dynamic_sector_caps a moment earlier) rather than re-fetching
+    it, so this costs nothing beyond scanning top_n ETF tickers.
+
+    No fundamentals layer here: ETFs don't have P/E, D/E, ROIC etc., so
+    the stock scorecard's fundamental scoring simply doesn't apply --
+    this is a momentum-only read, same as the Dual-Gate test alone would
+    give for a stock before any fundamentals overlay.
+    """
+    ranked_sectors = sorted(sector_rel_strength.items(), key=lambda kv: kv[1], reverse=True)
+    top_sectors = [s for s, _ in ranked_sectors[:top_n]]
+    tickers = [SECTOR_ETF_MAP[s] for s in top_sectors if s in SECTOR_ETF_MAP]
+
+    tech_df, tech_meta = get_technical_signals(tickers)
+
+    if not tech_df.empty:
+        ticker_to_sector = {v: k for k, v in SECTOR_ETF_MAP.items()}
+        tech_df["Sector"] = tech_df["Ticker"].map(ticker_to_sector)
+        tech_df["3M Relative Strength (%)"] = tech_df["Sector"].map(sector_rel_strength)
+        tech_df = tech_df.sort_values("3M Relative Strength (%)", ascending=False).reset_index(drop=True)
+
+    meta = {
+        "ranked_sectors": ranked_sectors,
+        "top_sectors": top_sectors,
+        "technical": tech_meta,
+    }
+    return tech_df, meta
 
 
 def run_scorecard_scan(tickers, satellite_budget=27000.0, top_n=15, weights=None,
@@ -511,8 +579,10 @@ def run_scorecard_scan(tickers, satellite_budget=27000.0, top_n=15, weights=None
         liquidity_floor_inr=liquidity_floor_inr, max_leverage_multiple=max_leverage_multiple,
     )
 
-    sector_caps = compute_dynamic_sector_caps()
+    sector_caps, sector_rel_strength, sector_calc_ok = compute_dynamic_sector_caps()
     scorecard_meta["sector_caps"] = sector_caps
+    scorecard_meta["sector_rel_strength"] = sector_rel_strength
+    scorecard_meta["sector_calc_ok"] = sector_calc_ok
 
     scored_candidates = scorecard_df[scorecard_df["Composite Score"].notna()].copy()
 

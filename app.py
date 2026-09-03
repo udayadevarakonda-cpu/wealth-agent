@@ -16,6 +16,7 @@ from screener import (
     build_ipo_recommendation,
     compute_ipo_valuation_tiers,
     compute_brlm_track_record,
+    scan_sector_etfs,
     DEFAULT_SCORECARD_WEIGHTS
 )
 
@@ -83,6 +84,25 @@ def render_skip_report(meta, label="items"):
             for name, reason in skipped:
                 st.write(f"- **{name}**: {reason}")
 
+
+# =============================================================================
+# SIDEBAR: VERTICAL PAGE NAVIGATION (replaces horizontal st.tabs)
+# =============================================================================
+# st.tabs() only renders horizontally -- there's no native vertical mode.
+# A sidebar radio is the standard Streamlit substitute: same one-page-at-a-
+# time behavior, stacked vertically, and scales better as more sections
+# get added. Each section's code below is UNCHANGED from its tab version --
+# only "with tabN:" became "if page == '...':", which behaves identically.
+PAGES = [
+    "📊 Strategic Asset Allocation & Detailed Blueprint",
+    "🎯 Tactical Stock Momentum",
+    "📈 Core Mutual Fund Qualifier Engine",
+    "🧪 Scenario Sandbox & Backtest Simulator",
+    "📒 Personal IPO Tracker",
+]
+st.sidebar.markdown("### 📑 Navigate")
+page = st.sidebar.radio("Navigate", PAGES, label_visibility="collapsed", key="page_nav")
+st.sidebar.markdown("---")
 
 # =============================================================================
 # SIDEBAR: FINANCIAL BASELINE & ALLOCATION SLICERS
@@ -253,20 +273,13 @@ else:
 st.markdown("---")
 
 # =============================================================================
-# MAIN TABS (4 TABS)
+# MAIN PAGES (5 PAGES, vertical sidebar navigation)
 # =============================================================================
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📊 Strategic Asset Allocation & Detailed Blueprint",
-    "🎯 Tactical Stock Momentum",
-    "📈 Core Mutual Fund Qualifier Engine",
-    "🧪 Scenario Sandbox & Backtest Simulator",
-    "📒 Personal IPO Tracker"
-])
 
 # =============================================================================
 # TAB 1: BLUEPRINT & RUNWAY ALLOCATION
 # =============================================================================
-with tab1:
+if page == "📊 Strategic Asset Allocation & Detailed Blueprint":
     st.subheader("📊 Capital Deployment Framework & Strategic Blueprint")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Liquid Capital", f"₹{total_managed_capital:,.2f}")
@@ -331,7 +344,7 @@ with tab1:
 # =============================================================================
 # TAB 2: TACTICAL SATELLITE & DYNAMIC SECTOR RADAR
 # =============================================================================
-with tab2:
+if page == "🎯 Tactical Stock Momentum":
     st.subheader("🎯 Tactical Stock Momentum & Dual-Gate Filter")
     universe_tickers, universe_meta = cached_universe(universe_choice, st.session_state.universe_bust)
 
@@ -431,6 +444,48 @@ with tab2:
             fig_bar.update_layout(height=320, margin=dict(t=20, b=20, l=10, r=10), yaxis_range=[0, 35])
             fig_bar.update_traces(texttemplate='%{text}%', textposition='outside')
             st.plotly_chart(fig_bar, use_container_width=True)
+
+    # -------------------------------------------------------------------
+    # TOP SECTOR ETFs — momentum confirmation on whichever sectors are
+    # CURRENTLY leading, not a fixed shortlist. Reuses sector_rel_strength
+    # already computed above -- no extra sector-benchmark fetches.
+    # -------------------------------------------------------------------
+    st.markdown("---")
+    st.markdown("#### 🎯 Top Sector ETFs — Momentum Confirmation")
+    st.caption(
+        "Same Dual-Gate test as the stock scanner (weekly SuperTrend + ADX + 200-day EMA), applied "
+        "to the single-sector ETF of whichever 4 sectors currently show the strongest 3-month "
+        "relative strength above. Ranks dynamically each run — a rotation into Energy or Materials "
+        "would show up here even though they aren't the 'usual' hot sectors."
+    )
+
+    sector_rel_strength = scorecard_meta.get("sector_rel_strength", {})
+    if sector_rel_strength:
+        etf_df, etf_meta = scan_sector_etfs(sector_rel_strength, top_n=4)
+
+        top_sectors_display = ", ".join(etf_meta.get("top_sectors", []))
+        st.caption(f"Currently ranked top 4: **{top_sectors_display}**")
+
+        etf_tech_meta = etf_meta.get("technical", {})
+        render_skip_report(etf_tech_meta, label="sector ETFs (technical data)")
+
+        if not etf_df.empty:
+            etf_display_cols = [
+                "Sector", "Stock", "3M Relative Strength (%)", "LTP (₹)",
+                "SuperTrend Bullish", "ADX", "Above 200 EMA", "Dynamic Stop (₹)", "Risk to Stop (%)"
+            ]
+            valid_etf_cols = [c for c in etf_display_cols if c in etf_df.columns]
+            st.dataframe(etf_df[valid_etf_cols], use_container_width=True, hide_index=True)
+            st.caption(
+                "No fundamentals layer here — ETFs don't have P/E, D/E, ROIC, etc., so this is a "
+                "momentum-only read (same Dual-Gate logic, no scorecard overlay). Some single-sector "
+                "ETFs trade thin — check the bid-ask spread yourself before sizing a position; this "
+                "table doesn't screen for liquidity."
+            )
+        else:
+            st.info("No sector ETF data returned — check the skip report above for why.")
+    else:
+        st.info("Sector relative-strength data isn't available yet — the ranking above needs to load first.")
 
     st.markdown("---")
 
@@ -730,7 +785,7 @@ with tab2:
 # =============================================================================
 # TAB 3: CORE MUTUAL FUND QUALIFIER
 # =============================================================================
-with tab3:
+if page == "📈 Core Mutual Fund Qualifier Engine":
     st.subheader("📈 Core Mutual Fund Qualifier Engine")
     st.caption("Screens AMFI NAV series using 200 EMA Trend + Regression Jensen's Alpha (α) + Sortino Downside Protection.")
 
@@ -781,7 +836,7 @@ with tab3:
 # =============================================================================
 # TAB 4: SCENARIO SANDBOX & INTERACTIVE BACKTESTER
 # =============================================================================
-with tab4:
+if page == "🧪 Scenario Sandbox & Backtest Simulator":
     st.subheader("🧪 Scenario Sandbox & Strategy Verification")
     
     tab4_sub1, tab4_sub2 = st.tabs(["📈 Multi-Year Growth Simulator", "🔬 Historical Momentum Backtester"])
@@ -878,7 +933,7 @@ with tab4:
 # =============================================================================
 # TAB 5: PERSONAL IPO VALUATION TRACKER
 # =============================================================================
-with tab5:
+if page == "📒 Personal IPO Tracker":
     st.subheader("📒 Personal IPO Valuation Tracker")
     st.caption(
         "A calculator you feed real RHP numbers into — not an auto-populated feature. "
